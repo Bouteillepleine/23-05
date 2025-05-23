@@ -124,6 +124,7 @@ jobs:
           ${{ env.REPO }} --trace sync -c --no-clone-bundle --no-tags --optimized-fetch -j$(nproc --all) --fail-fast || { echo "Error: repo sync failed"; exit 1; }
           echo "Cloning Clang toolchain..."
           git clone --depth=1 https://gitlab.com/kei-space/clang/r522817.git $PLATFORM/prebuilts/clang/host/linux-x86/clang-r522817 || { echo "Error: Clang clone failed"; exit 1; }
+          echo "Cloning r522817.git Clang toolchain..."
 
       - name: OnePlus
         run: |
