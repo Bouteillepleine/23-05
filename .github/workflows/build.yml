@@ -1,7 +1,7 @@
 name: Build
 permissions:
-  contents: write  # Allow writing to repository contents (for pushing tags)
-  actions: write   # Allows triggering actions
+  contents: write
+  actions: write
 
 on:
   workflow_call:
@@ -28,7 +28,6 @@ on:
 jobs:
   build-kernel-oneplus-kernelsu-susfs:
     runs-on: ubuntu-latest
-
     steps:
       - name: Configure Git
         run: |
@@ -36,44 +35,34 @@ jobs:
           git config --global user.email "builder@opluskernel.org"
 
       - name: Setup System
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 16384
+          temp-reserve-mb: 4096
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-powershell: 'true'
+          remove-swift: 'true'
+
+      - name: Install Dependencies
         run: |
           export DEBIAN_FRONTEND=noninteractive
           echo "DEBIAN_FRONTEND=noninteractive" >> $GITHUB_ENV
-          
-          df -h
-          
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/powershell /usr/share/swift || true
-          sudo docker image prune --all --force
-          echo "some directories deleted"
-          
-          sudo apt-get purge -y \
-            aria2 ansible azure-cli shellcheck rpm xorriso zsync \
-            esl-erlang firefox gfortran-8 gfortran-9 google-chrome-stable \
-            google-cloud-sdk imagemagick \
-            libmagickcore-dev libmagickwand-dev libmagic-dev ant ant-optional kubectl \
-            mercurial apt-transport-https mono-complete libmysqlclient \
-            unixodbc-dev yarn chrpath libssl-dev libxft-dev \
-            libfreetype6 libfreetype6-dev libfontconfig1 libfontconfig1-dev \
-            snmp pollinate libpq-dev postgresql-client powershell ruby-full \
-            sphinxsearch subversion mongodb-org microsoft-edge-stable || true
-          
-          sudo apt-get purge -y $(dpkg-query -W -f='${binary:Package}\n' | grep -E '^mysql|^php|^dotnet') || true
-          
-          sudo apt-get autoremove -y
-          sudo apt-get autoclean -y
-          echo "some packages purged"
-          
+          sudo apt update
+          sudo apt install -y python3 python-is-python3 git curl patch
           df -h
 
-      - name: Install Repo and Python
+      - name: Install Repo Tool
         run: |
-          sudo apt update
-          sudo apt install -y python3 python-is-python3
-          
           mkdir -p ./git-repo
           curl -sSL https://storage.googleapis.com/git-repo-downloads/repo > ./git-repo/repo
           chmod a+rx ./git-repo/repo
+          sudo ln -sf $GITHUB_WORKSPACE/git-repo/repo /bin/repo
           echo "REPO=$GITHUB_WORKSPACE/./git-repo/repo" >> $GITHUB_ENV
+          echo "PATH=$GITHUB_WORKSPACE/git-repo:$PATH" >> $GITHUB_ENV
 
       - name: Set Environment Variables
         run: |
@@ -81,9 +70,13 @@ jobs:
           CONFIG="${{ inputs.model }}"
           WORKSPACE_DIR="$GITHUB_WORKSPACE/kernel_workspace"
           PLATFORM_DIR="$WORKSPACE_DIR/kernel_platform"
+          COMMON_DIR="$PLATFORM_DIR/common"
+          DEFCONFIG="$COMMON_DIR/arch/arm64/configs/gki_defconfig"
           echo "CONFIG=$CONFIG" >> $GITHUB_ENV
           echo "WORKSPACE=$WORKSPACE_DIR" >> $GITHUB_ENV
           echo "PLATFORM=$PLATFORM_DIR" >> $GITHUB_ENV
+          echo "COMMON=$COMMON_DIR" >> $GITHUB_ENV
+          echo "DEFCONFIG=$DEFCONFIG" >> $GITHUB_ENV
           echo "CONFIG set to: $CONFIG"
           echo "WORKSPACE set to: $WORKSPACE_DIR"
           echo "PLATFORM set to: $PLATFORM_DIR"
@@ -99,6 +92,8 @@ jobs:
           git clone https://github.com/TheWildJames/AnyKernel3.git -b "$ANYKERNEL_BRANCH" || { echo "Error: Failed to clone AnyKernel3"; exit 1; }
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH" || { echo "Error: Failed to clone susfs4ksu"; exit 1; }
           git clone https://github.com/TheWildJames/kernel_patches.git || { echo "Error: Failed to clone kernel_patches"; exit 1; }
+          echo "Listing kernel_patches/next:"
+          ls -la kernel_patches/next/
 
       - name: Get SUSFS Version
         run: |
@@ -120,18 +115,21 @@ jobs:
           cd "$CONFIG"
           echo "Initializing and syncing kernel source..."
           ${{ env.REPO }} init -u https://github.com/OnePlusOSS/kernel_manifest.git -b ${{ inputs.branch }} -m ${{ inputs.manifest }} --repo-rev=v2.16 --depth=1 --no-clone-bundle --no-tags || { echo "Error: repo init failed"; exit 1; }
+          cat ${{ inputs.manifest }} || echo "Manifest file not found"
           ${{ env.REPO }} --version
           ${{ env.REPO }} --trace sync -c --no-clone-bundle --no-tags --optimized-fetch -j$(nproc --all) --fail-fast || { echo "Error: repo sync failed"; exit 1; }
           echo "Cloning Clang toolchain..."
           git clone --depth=1 https://gitlab.com/kei-space/clang/r522817.git $PLATFORM/prebuilts/clang/host/linux-x86/clang-r522817 || { echo "Error: Clang clone failed"; exit 1; }
-          echo "Cloning r522817.git Clang toolchain..."
+          echo "Listing contents of $COMMON to verify structure:"
+          ls -la "$COMMON" || echo "Warning: $COMMON directory not found or empty"
 
       - name: OnePlus
         run: |
           set -x
-          cd "$CONFIG/kernel_platform/common"
+          cd "$COMMON"
           if [ ! -f "arch/arm64/configs/gki_defconfig" ]; then
-            echo "Error: gki_defconfig not found"
+            echo "Error: gki_defconfig not found in $COMMON/arch/arm64/configs/"
+            ls -la arch/arm64/configs/
             exit 1
           fi
           chmod 644 arch/arm64/configs/gki_defconfig
@@ -149,8 +147,7 @@ jobs:
       - name: Add KernelSU-Next
         run: |
           set -x
-          echo "Changing to configuration directory: $CONFIG..."
-          cd "$CONFIG/kernel_platform"
+          cd "$PLATFORM"
           echo "Adding KernelSU-Next..."
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next-susfs-dev/kernel/setup.sh" | bash -s next || { echo "Error: Failed to run KernelSU-Next setup.sh"; exit 1; }
           git submodule update --init --recursive || { echo "Error: Failed to update submodules"; exit 1; }
@@ -167,8 +164,7 @@ jobs:
       - name: Apply SUSFS Patches
         run: |
           set -x
-          echo "Changing to configuration directory: $CONFIG..."
-          cd "$CONFIG/kernel_platform"
+          cd "$PLATFORM"
           echo "Applying SUSFS patches..."
           SUSFS_PATCH="../../susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}.patch"
           if [ ! -f "$SUSFS_PATCH" ]; then
@@ -199,91 +195,116 @@ jobs:
       - name: Apply KernelSU-Next Hooks
         run: |
           set -x
-          echo "Changing to configuration directory: $CONFIG..."
-          cd "$CONFIG/kernel_platform/common"
+          cd "$COMMON"
           PATCH_FILE="syscall_hooks.patch"
-          if [ ! -f "../../../kernel_patches/next/$PATCH_FILE" ]; then
-            echo "Error: $PATCH_FILE not found in kernel_patches/next/"
+          PATCH_SRC="$GITHUB_WORKSPACE/kernel_patches/next/$PATCH_FILE"
+          if [ ! -f "$PATCH_SRC" ]; then
+            echo "Error: $PATCH_FILE not found in $PATCH_SRC"
+            ls -la "$GITHUB_WORKSPACE/kernel_patches/next/"
             exit 1
           fi
-          cp "../../../kernel_patches/next/$PATCH_FILE" ./ || { echo "Error: Failed to copy $PATCH_FILE"; exit 1; }
+          cp "$PATCH_SRC" ./ || { echo "Error: Failed to copy $PATCH_FILE"; exit 1; }
           echo "Applying $PATCH_FILE..."
           patch -p1 --fuzz=3 --verbose < "./$PATCH_FILE" > syscall_hooks.log 2>&1 || { cat syscall_hooks.log; echo "Warning: Patch application failed or already applied, continuing..."; }
 
       - name: Apply Hide Stuff Patches
         run: |
           set -x
-          echo "Changing to configuration directory: $CONFIG..."
-          cd "$CONFIG/kernel_platform/common"
+          cd "$COMMON"
           PATCH_FILE="69_hide_stuff.patch"
-          if [ ! -f "../../../kernel_patches/$PATCH_FILE" ]; then
-            echo "Error: $PATCH_FILE not found in kernel_patches/"
+          PATCH_SRC="$GITHUB_WORKSPACE/kernel_patches/$PATCH_FILE"
+          if [ ! -f "$PATCH_SRC" ]; then
+            echo "Error: $PATCH_FILE not found in $PATCH_SRC"
+            ls -la "$GITHUB_WORKSPACE/kernel_patches/"
             exit 1
           fi
-          cp "../../../kernel_patches/$PATCH_FILE" ./ || { echo "Error: Failed to copy $PATCH_FILE"; exit 1; }
+          cp "$PATCH_SRC" ./ || { echo "Error: Failed to copy $PATCH_FILE"; exit 1; }
           echo "Applying $PATCH_FILE..."
           patch -p1 --fuzz=3 --verbose < "./$PATCH_FILE" > hide_stuff.log 2>&1 || { cat hide_stuff.log; echo "Warning: Patch application failed or already applied, continuing..."; }
-      
+
+      - name: Add Manager Patch
+        run: |
+          set -x
+          KSU_DIR="$PLATFORM/KernelSU-Next"
+          PATCH_FILE="manager.patch"
+          PATCH_SRC="$GITHUB_WORKSPACE/kernel_patches/next/$PATCH_FILE"
+          echo "Changing to KernelSU-Next directory: $KSU_DIR"
+          if [ ! -d "$KSU_DIR" ]; then
+            echo "Error: KernelSU-Next directory $KSU_DIR does not exist"
+            ls -la "$PLATFORM"
+            exit 1
+          fi
+          cd "$KSU_DIR"
+          if [ ! -f "$PATCH_SRC" ]; then
+            echo "Error: $PATCH_FILE not found in $PATCH_SRC"
+            ls -la "$GITHUB_WORKSPACE/kernel_patches/next/"
+            exit 1
+          fi
+          cp "$PATCH_SRC" ./ || { echo "Error: Failed to copy $PATCH_FILE"; exit 1; }
+          echo "Applying $PATCH_FILE..."
+          patch -p1 --fuzz=3 --verbose < "./$PATCH_FILE" > manager.log 2>&1 || { cat manager.log; echo "Warning: Patch application failed or already applied, continuing..."; }
+
       - name: Add SUSFS Configuration Settings
         run: |
           set -x
-          echo "Changing to configuration directory: $CONFIG..."
-          cd "$CONFIG/kernel_platform"
+          cd "$PLATFORM"
           echo "Adding configuration settings to gki_defconfig..."
-          echo "CONFIG_KSU=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_WITH_KPROBES=n" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SUS_SU=n" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_TMPFS_XATTR=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_TMPFS_POSIX_ACL=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_WIREGUARD=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_NF_NAT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_NF_TARGET_TTL=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP6_NF_TARGET_HL=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP6_NF_MATCH_HL=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_DEBUG_KERNEL=n" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_DYNAMIC_DEBUG=n" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_DEBUG_INFO=n" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_TCP_CONG_ADVANCED=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_TCP_CONG_BBR=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_DEFAULT_TCP_CONG=\"bbr\"" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_TCP_CONG_CDG=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_DEFAULT_BBR=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_DEFAULT_CUBIC=n" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_DEFAULT_CDG=n" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_NET_SCH_DEFAULT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_DEFAULT_FQ=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo 'CONFIG_DEFAULT_NET_SCH="fq"' >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_NET_SCH_HTB=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_NET_SCH_PRIO=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_NET_SCH_SFQ=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_NET_SCH_TBF=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_TCP_CONG_BIC=n" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_TCP_CONG_WESTWOOD=n" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_TCP_CONG_HTCP=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_NF_TARGET_ECN=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_ECN=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_TCP_ECN=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IPV6_ECN=y" >> ./common/arch/arm64/configs/gki_defconfig
+          cat >> "$DEFCONFIG" << EOF
+          CONFIG_KSU=y
+          CONFIG_KSU_WITH_KPROBES=n
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_SU=n
+          CONFIG_TMPFS_XATTR=y
+          CONFIG_TMPFS_POSIX_ACL=y
+          CONFIG_WIREGUARD=y
+          CONFIG_IP_NF_NAT=y
+          CONFIG_IP_NF_TARGET_TTL=y
+          CONFIG_IP6_NF_TARGET_HL=y
+          CONFIG_IP6_NF_MATCH_HL=y
+          CONFIG_DEBUG_KERNEL=n
+          CONFIG_DYNAMIC_DEBUG=n  
+          CONFIG_DEBUG_INFO=n
+          CONFIG_TCP_CONG_ADVANCED=y
+          CONFIG_TCP_CONG_BBR=y
+          CONFIG_DEFAULT_TCP_CONG="bbr"
+          CONFIG_TCP_CONG_CDG=y
+          CONFIG_DEFAULT_BBR=y
+          CONFIG_DEFAULT_CUBIC=n
+          CONFIG_DEFAULT_CDG=n
+          CONFIG_NET_SCH_DEFAULT=y
+          CONFIG_DEFAULT_FQ=y
+          CONFIG_DEFAULT_NET_SCH="fq"
+          CONFIG_NET_SCH_HTB=y
+          CONFIG_NET_SCH_PRIO=y
+          CONFIG_NET_SCH_SFQ=y
+          CONFIG_NET_SCH_TBF=y
+          CONFIG_TCP_CONG_BIC=n
+          CONFIG_TCP_CONG_WESTWOOD=n
+          CONFIG_TCP_CONG_HTCP=y
+          CONFIG_IP_NF_TARGET_ECN=y
+          CONFIG_IP_ECN=y
+          CONFIG_TCP_ECN=y
+          CONFIG_IPV6_ECN=y
+          EOF
 
       - name: Add sched_ext
         run: |
           set -x
-          cd "$CONFIG/kernel_platform"
+          cd "$PLATFORM"
           git clone https://github.com/egcd123/sched_ext.git || { echo "Error: Failed to clone sched_ext"; exit 1; }
           cp -r ./sched_ext/* ./common/kernel/sched || { echo "Error: Failed to copy sched_ext files"; exit 1; }
           rm -rf ./sched_ext/.git
@@ -293,12 +314,11 @@ jobs:
       - name: Run sed and perl Commands
         run: |
           set -x
-          echo "Changing to configuration directory: $CONFIG..."
-          cd "$CONFIG/kernel_platform"
+          cd "$PLATFORM"
           echo "Running sed commands..."
-          sed -i 's/CONFIG_LTO=n/CONFIG_LTO=y/' "./common/arch/arm64/configs/gki_defconfig"
-          sed -i 's/CONFIG_LTO_CLANG_FULL=y/CONFIG_LTO_CLANG_THIN=y/' "./common/arch/arm64/configs/gki_defconfig"
-          sed -i 's/CONFIG_LTO_CLANG_NONE=y/CONFIG_LTO_CLANG_THIN=y/' "./common/arch/arm64/configs/gki_defconfig"
+          sed -i 's/CONFIG_LTO=n/CONFIG_LTO=y/' "$DEFCONFIG"
+          sed -i 's/CONFIG_LTO_CLANG_FULL=y/CONFIG_LTO_CLANG_THIN=y/' "$DEFCONFIG"
+          sed -i 's/CONFIG_LTO_CLANG_NONE=y/CONFIG_LTO_CLANG_THIN=y/' "$DEFCONFIG"
           sed -i 's/check_defconfig//' ./common/build.config.gki
           sed -i '$s|echo "\$res"|echo "\$res"|' ./common/scripts/setlocalversion
           sed -i '$s|echo "\$res"|echo "\$res"|' ./msm-kernel/scripts/setlocalversion
@@ -314,30 +334,18 @@ jobs:
           perl -pi -e 's{UTS_VERSION="\$\(echo \$UTS_VERSION \$CONFIG_FLAGS \$TIMESTAMP \| cut -b -\$UTS_LEN\)"}{UTS_VERSION="#1 SMP PREEMPT $(date -u +"%a %b %d %H:%M:%S UTC %Y")"}' ./msm-kernel/scripts/mkcompile_h
           find . -type f -exec sed -i 's/\(make\s\+-C[^\n]*\)\s\+/\1 -j$(nproc) /g' {} +
 
-      - name: Add Manager Patch
-        run: |
-          set -x
-          cd "$CONFIG/kernel_platform/KernelSU-Next"
-          PATCH_FILE="manager.patch"
-          if [ ! -f "../../../kernel_patches/next/$PATCH_FILE" ]; then
-            echo "Error: $PATCH_FILE not found in kernel_patches/next/"
-            exit 1
-          fi
-          cp "../../../kernel_patches/next/$PATCH_FILE" ./ || { echo "Error: Failed to copy $PATCH_FILE"; exit 1; }
-          echo "Applying $PATCH_FILE..."
-          patch -p1 --fuzz=3 --verbose < "./$PATCH_FILE" > manager.log 2>&1 || { cat manager.log; echo "Warning: Patch application failed or already applied, continuing..."; }
-
       - name: Build the Kernel
         run: |
           set -x
-          echo "Changing to configuration directory: $CONFIG..."
           cd "$CONFIG"
           echo "Building the kernel..."
           sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
           rm ./kernel_platform/common/android/abi_gki_protected_exports_* || echo "No protected exports!"
           rm ./kernel_platform/msm-kernel/android/abi_gki_protected_exports_* || echo "No protected exports!"
+          rm -rf ./kernel_platform/out/bazel/cache || echo "No Bazel cache to clear!"
+          df -h
           BUILD_TYPE="gki"
-          BAZEL_ARGS=(--jobs=$(nproc --all) --lto=thin --sandbox_debug --verbose_failures)
+          BAZEL_ARGS=(--jobs=4 --lto=thin --sandbox_debug --verbose_failures --verbose_explanations)
           if [ "${{ inputs.soc }}" == "sun" ]; then
             BUILD_TYPE="perf"
             BAZEL_ARGS+=(-g)
@@ -351,6 +359,11 @@ jobs:
               echo "======"
               top -b -n 1 | head -n 15
               echo ""
+              AVAILABLE_SPACE=$(df -B1 / | tail -1 | awk "{print \$4}")
+              if [ "$AVAILABLE_SPACE" -lt 2147483648 ]; then
+                echo "Error: Less than 2GB free space remaining"
+                exit 1
+              fi
               sleep 60
             done
           ') &
@@ -358,18 +371,25 @@ jobs:
           trap "kill $MONITOR_PID" EXIT
           if [ -f ./kernel_platform/build_with_bazel.py ]; then
             ./kernel_platform/oplus/bazel/oplus_modules_variant.sh ${{ inputs.soc }} "$BUILD_TYPE" ""
-            ./kernel_platform/build_with_bazel.py -t ${{ inputs.soc }} $BUILD_TYPE "${BAZEL_ARGS[@]}" -o "$(pwd)/out"
+            echo "Verifying images before lpmake..."
+            ls -l bazel-out/k8-fastbuild/bin/common/kernel_aarch64_images_system_dlkm_image/ || echo "System DLKM image directory not found"
+            ls -l bazel-out/k8-fastbuild/bin/msm-kernel/pineapple_gki_images_vendor_dlkm_image/ || echo "Vendor DLKM image directory not found"
+            ./kernel_platform/build_with_bazel.py -t ${{ inputs.soc }} $BUILD_TYPE "${BAZEL_ARGS[@]}" -o "$(pwd)/out" || {
+              echo "Bazel build failed, inspecting output directory..."
+              ls -la ./out/dist/
+              exit 1
+            }
           else
-            LTO=thin ./kernel_platform/oplus/build/oplus_build_kernel.sh ${{ inputs.soc }} "$BUILD_TYPE"
+            LTO=thin ./kernel_platform/oplus/build/oplus_build_kernel.sh ${{ inputs.soc }} "$BUILD_TYPE" --jobs=4 || { echo "Kernel build failed"; exit 1; }
           fi
 
       - name: Copy Images
         run: |
           set -x
-          echo "Changing to configuration directory: $CONFIG..."
           cd "$CONFIG"
           if [ ! -f "./out/dist/Image" ]; then
             echo "Error: Kernel Image not found in out/dist/"
+            ls -la ./out/dist/
             exit 1
           fi
           echo "Copying Image"
@@ -378,7 +398,6 @@ jobs:
       - name: Create AnyKernel3 ZIP File
         run: |
           set -x
-          echo "Navigating to AnyKernel3 directory..."
           cd ./AnyKernel3
           ZIP_NAME="${{ inputs.model }}_${{ inputs.android_version }}-${{ inputs.kernel_version }}_KSUN-${{ env.KSUVER }}_SUSFS-${{ env.SUSFSVER }}_AnyKernel3.zip"
           echo "Creating zip file $ZIP_NAME..."
@@ -390,3 +409,4 @@ jobs:
           name: kernel-${{ env.CONFIG }}
           path: |
             *.zip
+```
