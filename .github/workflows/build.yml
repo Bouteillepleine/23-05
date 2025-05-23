@@ -63,6 +63,7 @@ jobs:
           sudo ln -sf $GITHUB_WORKSPACE/git-repo/repo /bin/repo
           echo "REPO=$GITHUB_WORKSPACE/./git-repo/repo" >> $GITHUB_ENV
           echo "PATH=$GITHUB_WORKSPACE/git-repo:$PATH" >> $GITHUB_ENV
+          /bin/repo --version
 
       - name: Set Environment Variables
         run: |
@@ -114,14 +115,42 @@ jobs:
           mkdir -p "$CONFIG"
           cd "$CONFIG"
           echo "Initializing and syncing kernel source..."
+          sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
+          rm -rf /tmp/* ~/.cache/* || echo "No temp files to clear"
+          df -h
           ${{ env.REPO }} init -u https://github.com/OnePlusOSS/kernel_manifest.git -b ${{ inputs.branch }} -m ${{ inputs.manifest }} --repo-rev=v2.16 --depth=1 --no-clone-bundle --no-tags || { echo "Error: repo init failed"; exit 1; }
+          echo "Manifest contents:"
           cat ${{ inputs.manifest }} || echo "Manifest file not found"
           ${{ env.REPO }} --version
-          ${{ env.REPO }} --trace sync -c --no-clone-bundle --no-tags --optimized-fetch -j$(nproc --all) --fail-fast || { echo "Error: repo sync failed"; exit 1; }
+          (stdbuf -oL bash -c '
+            while true; do
+              echo "=== $(date) ==="
+              free -h
+              echo "======"
+              df -h
+              echo "======"
+              top -b -n 1 | head -n 15
+              echo ""
+              AVAILABLE_SPACE=$(df -B1 / | tail -1 | awk "{print \$4}")
+              if [ "$AVAILABLE_SPACE" -lt 2147483648 ]; then
+                echo "Error: Less than 2GB free space remaining"
+                exit 1
+              fi
+              sleep 30
+            done
+          ') &
+          MONITOR_PID=$!
+          trap "kill $MONITOR_PID" EXIT
+          ${{ env.REPO }} --trace sync -c --no-clone-bundle --no-tags --optimized-fetch -j4 --fail-fast || { echo "Error: repo sync failed"; exit 1; }
+          echo "Listing synced projects:"
+          ${{ env.REPO }} list -f > repo_projects.txt
+          cat repo_projects.txt
+          echo "Verifying directory structure..."
+          ls -la "$PLATFORM" || { echo "Error: $PLATFORM directory not found"; exit 1; }
+          ls -la "$COMMON" || { echo "Error: $COMMON directory not found"; ls -la "$PLATFORM"; exit 1; }
           echo "Cloning Clang toolchain..."
-          git clone --depth=1 https://gitlab.com/kei-space/clang/r522817.git $PLATFORM/prebuilts/clang/host/linux-x86/clang-r522817 || { echo "Error: Clang clone failed"; exit 1; }
-          echo "Listing contents of $COMMON to verify structure:"
-          ls -la "$COMMON" || echo "Warning: $COMMON directory not found or empty"
+          mkdir -p "$PLATFORM/prebuilts/clang/host/linux-x86"
+          git clone --depth=1 https://gitlab.com/kei-space/clang/r522817.git "$PLATFORM/prebuilts/clang/host/linux-x86/clang-r522817" || { echo "Error: Clang clone failed"; exit 1; }
 
       - name: OnePlus
         run: |
@@ -244,7 +273,7 @@ jobs:
           echo "Applying $PATCH_FILE..."
           patch -p1 --fuzz=3 --verbose < "./$PATCH_FILE" > manager.log 2>&1 || { cat manager.log; echo "Warning: Patch application failed or already applied, continuing..."; }
 
-      - name: Add SUSFS Configuration Settings
+      - name: Add SUSFS Configuration Settings        
         run: |
           set -x
           cd "$PLATFORM"
@@ -318,7 +347,7 @@ jobs:
           echo "Running sed commands..."
           sed -i 's/CONFIG_LTO=n/CONFIG_LTO=y/' "$DEFCONFIG"
           sed -i 's/CONFIG_LTO_CLANG_FULL=y/CONFIG_LTO_CLANG_THIN=y/' "$DEFCONFIG"
-          sed -i 's/CONFIG_LTO_CLANG_NONE=y/CONFIG_LTO_CLANG_THIN=y/' "$DEFCONFIG"
+          sed -i 's/CONFIG_LTO_CLANG_NONE=y/CONCONFIG_LTO_CLANG_THIN=y/' "$DEFCONFIG"
           sed -i 's/check_defconfig//' ./common/build.config.gki
           sed -i '$s|echo "\$res"|echo "\$res"|' ./common/scripts/setlocalversion
           sed -i '$s|echo "\$res"|echo "\$res"|' ./msm-kernel/scripts/setlocalversion
@@ -364,7 +393,7 @@ jobs:
                 echo "Error: Less than 2GB free space remaining"
                 exit 1
               fi
-              sleep 60
+              sleep 30
             done
           ') &
           MONITOR_PID=$!
