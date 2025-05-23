@@ -312,17 +312,17 @@ jobs:
           cd common/kernel/sched
           sed -i.bak '/# include "ext.c"/a\# include "hmbird_sched_proc_main.c"\n#endif\n\n#ifdef CONFIG_SLIM_SCHED\n# include "slim_sysctl.c"' build_policy.c
 
-      - name: Add fengchi
-        run: |
-          set -x
-          cd "$CONFIG/kernel_platform/common"
-          PATCH_URL="https://github.com/reigadegr/Action-Build/raw/gki_official/fengchi.patch"
-          PATCH_FILE="fengchi.patch"
-          echo "Downloading $PATCH_FILE..."
-          curl -L -o "$PATCH_FILE" "$PATCH_URL" || { echo "Error: Failed to download fengchi.patch"; exit 1; }
-          echo "Applying $PATCH_FILE..."
-          git apply "$PATCH_FILE" || { echo "Error: Failed to apply fengchi.patch"; exit 1; }
-          echo "Fengchi patch applied successfully"
+#      - name: Add fengchi
+#        run: |
+#          set -x
+#          cd "$CONFIG/kernel_platform/common"
+#          PATCH_URL="https://github.com/reigadegr/Action-Build/raw/gki_official/fengchi.patch"
+#          PATCH_FILE="fengchi.patch"
+#          echo "Downloading $PATCH_FILE..."
+#          curl -L -o "$PATCH_FILE" "$PATCH_URL" || { echo "Error: Failed to download fengchi.patch"; exit 1; }
+#          echo "Applying $PATCH_FILE..."
+#          git apply "$PATCH_FILE" || { echo "Error: Failed to apply fengchi.patch"; exit 1; }
+#          echo "Fengchi patch applied successfully"
 
       - name: Run sed and perl Commands
         run: |
