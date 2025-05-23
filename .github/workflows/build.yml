@@ -24,24 +24,15 @@ on:
       kernel_version:
         required: true
         type: string
-
+  
 jobs:
   build-kernel-oneplus-kernelsu-susfs:
     runs-on: [self-hosted, ubuntu-24.04]
     env:
       ACTIONS_RUNNER_DEBUG: true
       ACTIONS_STEP_DEBUG: true
-
+      
     steps:
-      - name: Verify Runner Tools
-        run: |
-          set -x
-          command -v git || { echo "Error: git not installed"; exit 1; }
-          command -v curl || { echo "Error: curl not installed"; exit 1; }
-          command -v patch || { echo "Error: patch not installed"; exit 1; }
-          command -v python3 || { echo "Error: python3 not installed"; exit 1; }
-          command -v bazel || { echo "Error: bazel not installed"; exit 1; }
-
       - name: Setup System
         run: |
           set -x
@@ -50,29 +41,29 @@ jobs:
           echo "Work directory: $(pwd)"
           sudo rm -rf * || true
           sudo rm -rf .[^.]* || true
-
+          
       - name: Install Python3
         run: |
           set -x
           if ! command -v python3 &> /dev/null; then
-            echo "🔹 Python3 not found, updating apt and installing..."
+            echo "🔹Python3 not found, updating apt and installing..."
             sudo apt update
             sudo apt install -y python3 python-is-python3
           else
-            echo "🔹 Python3 is already installed at $(which python3)"
+            echo "🔹Python3 is already installed at $(which python3)"
           fi
 
       - name: Install Repo
         run: |
           set -x
           if ! command -v repo &> /dev/null; then
-            echo "🔹 Repo not found, installing..."
+            echo "🔹Repo not found, installing..."
             mkdir -p ./git-repo
             curl -sSL https://storage.googleapis.com/git-repo-downloads/repo > ./git-repo/repo
             chmod a+rx ./git-repo/repo
             echo "REPO=$GITHUB_WORKSPACE/./git-repo/repo" >> $GITHUB_ENV
           else
-            echo "🔹 Repo is already installed at $(which repo)"
+            echo "🔹Repo is already installed at $(which repo)"
             echo "REPO=$(which repo)" >> $GITHUB_ENV
           fi
 
@@ -80,9 +71,19 @@ jobs:
         run: |
           set -x
           CONFIG="${{ inputs.model }}"
+          
+          # Set CONFIG as an environment variable for future steps
+          echo "CONFIG=$CONFIG" >> $GITHUB_ENV
+          
+          echo "CONFIG set to: $CONFIG"
+          
+      - name: Set CONFIG Environment Variable
+        run: |
+          set -x
+          CONFIG="${{ inputs.model }}"
           echo "CONFIG=$CONFIG" >> $GITHUB_ENV
           echo "CONFIG set to: $CONFIG"
-
+          
       - name: Clone AnyKernel3 and Other Dependencies
         run: |
           set -x
