@@ -223,20 +223,7 @@ jobs:
           cp "../../../kernel_patches/$PATCH_FILE" ./ || { echo "Error: Failed to copy $PATCH_FILE"; exit 1; }
           echo "Applying $PATCH_FILE..."
           patch -p1 --fuzz=3 --verbose < "./$PATCH_FILE" > hide_stuff.log 2>&1 || { cat hide_stuff.log; echo "Warning: Patch application failed or already applied, continuing..."; }
-
-      - name: Add Manager Patch
-        run: |
-          set -x
-          cd "$CONFIG/kernel_platform/KernelSU-Next"
-          PATCH_FILE="manager.patch"
-          if [ ! -f "../../../kernel_patches/next/$PATCH_FILE" ]; then
-            echo "Error: $PATCH_FILE not found in kernel_patches/next/"
-            exit 1
-          fi
-          cp "../../../kernel_patches/next/$PATCH_FILE" ./ || { echo "Error: Failed to copy $PATCH_FILE"; exit 1; }
-          echo "Applying $PATCH_FILE..."
-          patch -p1 --fuzz=3 --verbose < "./$PATCH_FILE" > manager.log 2>&1 || { cat manager.log; echo "Warning: Patch application failed or already applied, continuing..."; }
-
+      
       - name: Add SUSFS Configuration Settings
         run: |
           set -x
