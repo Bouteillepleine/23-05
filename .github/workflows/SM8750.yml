@@ -66,6 +66,42 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - name: Maximize Build Space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 16384
+          temp-reserve-mb: 4096
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-powershell: 'true'
+          remove-swift: 'true'
+
+      - name: Configure Git & Install Dependencies
+        run: |
+          git config --global user.name "Build_O+"
+          git config --global user.email "builder@opluskernel.org"
+          export DEBIAN_FRONTEND=noninteractive
+          echo "DEBIAN_FRONTEND=noninteractive" >> $GITHUB_ENV
+          sudo apt update -y
+          sudo apt-mark hold firefox
+          sudo apt upgrade -y -o Dpkg::Options::="--force-confold"
+          sudo apt install -y python3 python-is-python3 git git-lfs curl patch
+          git lfs install
+          df -h
+
+      - name: Install Repo Tool
+        run: |
+          mkdir -p ./git-repo
+          curl -sSL https://storage.googleapis.com/git-repo-downloads/repo > ./git-repo/repo
+          chmod a+rx ./git-repo/repo
+          sudo ln -sf $GITHUB_WORKSPACE/git-repo/repo /bin/repo
+          echo "REPO=$GITHUB_WORKSPACE/./git-repo/repo" >> $GITHUB_ENV
+          echo "PATH=$GITHUB_WORKSPACE/git-repo:$PATH" >> $GITHUB_ENV
+          /bin/repo --version
+
       - name: Parse VERSION input
         run: |
           VERSION=$(echo "${{ github.event.inputs.VERSION }}")
@@ -77,14 +113,11 @@ jobs:
       - name: Parse Device Name
         run: |
           FILE="${{ inputs.FILE }}"
-          # Remove trailing _v (if present)
           BASE_NAME="${FILE%_u}"
           BASE_NAME="${BASE_NAME%_v}"
-          # Extract brand (part before the first underscore)
           RAW_BRAND="${BASE_NAME%%_*}"
-          # Extract model (all parts after the brand)
           MODEL="${BASE_NAME#*_}"
-          MODEL="${MODEL//_/ }"  # Replace underscores with spaces, e.g., ace5_pro -> ace5 pro
+          MODEL="${MODEL//_/ }"
           case "$RAW_BRAND" in
             oneplus) BRAND="OnePlus" ;;
             oppo)    BRAND="OPPO" ;;
@@ -96,6 +129,7 @@ jobs:
 
       - name: Set Environment Variables
         run: |
+          set -x
           WORKSPACE_DIR="$GITHUB_WORKSPACE/kernel_workspace"
           PLATFORM_DIR="$WORKSPACE_DIR/kernel_platform"
           COMMON_DIR="$PLATFORM_DIR/common"
@@ -105,47 +139,48 @@ jobs:
           echo "COMMON=$COMMON_DIR" >> $GITHUB_ENV
           echo "DEFCONFIG=$DEFCONFIG" >> $GITHUB_ENV
 
-      - name: Maximize Build Space
-        uses: easimon/maximize-build-space@master
-        with:
-          root-reserve-mb: 8192
-          temp-reserve-mb: 2048
-          swap-size-mb: 8192
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
-
-      - name: Configure Git & Install Dependencies
-        run: |
-          git config --global user.name "Build_O+"
-          git config --global user.email "builder@opluskernel.org"
-          sudo apt update -y
-          sudo apt-mark hold firefox
-          sudo apt upgrade -y -o Dpkg::Options::="--force-confold"
-          sudo apt install -y python3 git git-lfs curl && git lfs install
-
-      - name: Install Repo Tool
-        run: |
-          mkdir -p ./git-repo
-          curl -sSL https://storage.googleapis.com/git-repo-downloads/repo > ./git-repo/repo
-          chmod a+rx ./git-repo/repo
-          echo "REPO=$GITHUB_WORKSPACE/./git-repo/repo" >> $GITHUB_ENV
-
       - name: Initialize Repo and Sync
         run: |
           set -x
-          mkdir -p "$WORKSPACE" && cd "$WORKSPACE"
-          ${{ env.REPO }} init -u https://github.com/OnePlusOSS/kernel_manifest.git -b refs/heads/oneplus/${{ inputs.SoC }} -m ${{ inputs.FILE }}.xml --depth=1 || { echo "repo init failed"; exit 1; }
-          ${{ env.REPO }} sync -c -j$(nproc --all) --no-tags || { echo "repo sync failed"; exit 1; }
-          git clone --depth=1 https://gitlab.com/kei-space/clang/r522817.git "$PLATFORM/prebuilts/clang/host/linux-x86/clang-r522817" || { echo "Clang clone failed"; exit 1; }
-          echo "Listing contents of $COMMON to verify structure:"
-          ls -la "$COMMON" || echo "Warning: $COMMON directory not found or empty"
+          mkdir -p "$PLATFORM"
+          cd "$WORKSPACE"
+          sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
+          rm -rf /tmp/* ~/.cache/* || echo "No temp files to clear"
+          df -h
+          ${{ env.REPO }} init -u https://github.com/OnePlusOSS/kernel_manifest.git -b refs/heads/oneplus/${{ inputs.SoC }} -m ${{ inputs.FILE }}.xml --depth=1 --no-clone-bundle --no-tags || { echo "Error: repo init failed"; exit 1; }
+          echo "Manifest contents:"
+          cat ${{ inputs.FILE }}.xml || echo "Manifest file not found"
+          (stdbuf -oL bash -c '
+            while true; do
+              echo "=== $(date) ==="
+              free -h
+              echo "======"
+              df -h
+              echo "======"
+              top -b -n 1 | head -n 15
+              echo ""
+              AVAILABLE_SPACE=$(df -B1 / | tail -1 | awk "{print \$4}")
+              if [ "$AVAILABLE_SPACE" -lt 2147483648 ]; then
+                echo "Error: Less than 2GB free space remaining"
+                exit 1
+              fi
+              sleep 30
+            done
+          ') &
+          MONITOR_PID=$!
+          trap "kill $MONITOR_PID" EXIT
+          ${{ env.REPO }} sync -c -j4 --no-clone-bundle --no-tags --optimized-fetch --fail-fast || { echo "Error: repo sync failed"; exit 1; }
+          echo "Listing synced projects:"
+          ${{ env.REPO }} list -f > repo_projects.txt
+          cat repo_projects.txt
+          ls -la "$PLATFORM" || { echo "Error: $PLATFORM directory not found"; exit 1; }
+          ls -la "$COMMON" || { echo "Error: $COMMON directory not found"; ls -la "$PLATFORM"; exit 1; }
+          mkdir -p "$PLATFORM/prebuilts/clang/host/linux-x86"
+          git clone --depth=1 https://gitlab.com/kei-space/clang/r522817.git "$PLATFORM/prebuilts/clang/host/linux-x86/clang-r522817" || { echo "Error: Clang clone failed"; exit 1; }
 
       - name: OnePlus
         run: |
           set -x
-          echo "Changing to COMMON directory: $COMMON"
           if [ -z "$COMMON" ]; then
             echo "Error: COMMON environment variable is unset"
             exit 1
@@ -187,11 +222,10 @@ jobs:
         if: ${{ startsWith(inputs.KSU_CONFIG, 'SukiSU') }}
         run: |
           cd "$PLATFORM"
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s ${{ env.SukiSU_BRANCH }}
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s ${{ env.SukiSU_BRANCH }} || { echo "Error: SukiSU setup failed"; exit 1; }
           cd ./KernelSU
           KSU_VERSION=$(expr $(/usr/bin/git rev-list --count main) "+" 10606)
           echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
-          export KSU_VERSION=$KSU_VERSION
           sed -i "s/DKSU_VERSION=12800/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
           echo "KernelSU version: $KSU_VERSION"
 
@@ -199,104 +233,119 @@ jobs:
         if: ${{ startsWith(inputs.KSU_CONFIG, 'SukiSU') && inputs.SUSFS == 'enable' }}
         run: |
           cd "$WORKSPACE"
-          git clone https://github.com/SukiSU-Ultra/SukiSU_patch.git
-          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
-          cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch "$COMMON/"
-          cp ./susfs4ksu/kernel_patches/fs/* "$COMMON/fs/"
-          cp ./susfs4ksu/kernel_patches/include/linux/* "$COMMON/include/linux/"
-          cp ./SukiSU_patch/69_hide_stuff.patch "$COMMON/"
+          git clone https://github.com/SukiSU-Ultra/SukiSU_patch.git || { echo "Error: Failed to clone SukiSU_patch"; exit 1; }
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }} || { echo "Error: Failed to clone susfs4ksu"; exit 1; }
+          SUSFS_PATCH="./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch"
+          if [ ! -f "$SUSFS_PATCH" ]; then
+            echo "Error: SUSFS patch file $SUSFS_PATCH not found"
+            ls -la ./susfs4ksu/kernel_patches/
+            exit 1
+          fi
+          cp "$SUSFS_PATCH" "$COMMON/" || { echo "Error: Failed to copy SUSFS patch"; exit 1; }
+          cp ./susfs4ksu/kernel_patches/fs/* "$COMMON/fs/" || { echo "Error: Failed to copy fs patches"; exit 1; }
+          cp ./susfs4ksu/kernel_patches/include/linux/* "$COMMON/include/linux/" || { echo "Error: Failed to copy include patches"; exit 1; }
+          cp ./SukiSU_patch/69_hide_stuff.patch "$COMMON/" || { echo "Error: Failed to copy hide patch"; exit 1; }
           cd "$COMMON"
-          echo "Applying susfs patch to kernel..."
           if [[ "${{ env.KERNEL_VERSION }}" == "6.6" && "${{ inputs.FILE }}" != "oneplus_13t" ]]; then
             sed -i '/#include <trace\/hooks\/blk.h>/a #include <trace/hooks/fs.h>' ./fs/namespace.c
           fi
-          patch -p1 < "50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch" || { echo "Applying susfs patch failed"; exit 1; }
-          echo "susfs patch applied successfully"
+          echo "Applying susfs patch..."
+          patch -p1 < "50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch" > susfs_patch.log 2>&1 || { cat susfs_patch.log; echo "Error: Applying susfs patch failed"; exit 1; }
+          echo "Applying hide patch..."
+          patch -p1 < "69_hide_stuff.patch" > hide_patch.log 2>&1 || { cat hide_patch.log; echo "Error: Applying hide patch failed"; exit 1; }
+          echo "SUSFS and hide patches applied successfully"
 
       - name: Apply New Hooks Patches
         if: ${{ startsWith(inputs.KSU_CONFIG, 'SukiSU') && inputs.VFS == 'enable' }}
         run: |
           cd "$WORKSPACE"
           if [ ! -d SukiSU_patch ]; then
-            git clone https://github.com/SukiSU-Ultra/SukiSU_patch.git
-          else
-            echo "SukiSU_patch directory already exists, skipping clone."
+            git clone https://github.com/SukiSU-Ultra/SukiSU_patch.git || { echo "Error: Failed to clone SukiSU_patch"; exit 1; }
           fi
-          cp ./SukiSU_patch/hooks/syscall_hooks.patch "$COMMON/"
+          cp ./SukiSU_patch/hooks/syscall_hooks.patch "$COMMON/" || { echo "Error: Failed to copy syscall_hooks.patch"; exit 1; }
           cd "$COMMON"
           echo "Applying vfs patch..."
-          patch -p1 -F 3 < "syscall_hooks.patch" || { echo "Applying vfs patch failed"; exit 1; }
-          echo "vfs patch applied successfully"
+          patch -p1 -F 3 < "syscall_hooks.patch" > vfs_patch.log 2>&1 || { cat vfs_patch.log; echo "Error: Applying vfs patch failed"; exit 1; }
+          echo "VFS patch applied successfully"
 
       - name: Configure Kernel
         run: |
           cd "$WORKSPACE"
+          sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
+          rm -rf /tmp/* ~/.cache/* || echo "No temp files to clear"
           rm $PLATFORM/common/android/abi_gki_protected_exports_* || echo "No protected exports!"
           rm $PLATFORM/msm-kernel/android/abi_gki_protected_exports_* || echo "No protected exports!"
           sed -i 's/check_defconfig//' "$PLATFORM/common/build.config.gki"
           sed -i 's/ -dirty//g' "$PLATFORM/common/scripts/setlocalversion"
           sed -i 's/ -dirty//g' "$PLATFORM/msm-kernel/scripts/setlocalversion"
           sed -i 's/ -dirty//g' "$PLATFORM/external/dtc/scripts/setlocalversion"
-          sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" "$PLATFORM/build/kernel/kleaf/impl/stamp.bzl"
-          sed -i '/KMI_GENERATION/s/-$oki_infix//g' "$PLATFORM/build/kernel/kleaf/impl/stamp.bzl"
+          sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" "$PLATFORM/build/kernel/kleaf/impl/stamp.bzl" || echo "No stamp.bzl"
+          sed -i '/KMI_GENERATION/s/-$oki_infix//g' "$PLATFORM/build/kernel/kleaf/impl/stamp.bzl" || echo "No stamp.bzl"
           sed -i 's/^\(CONFIG_LOCALVERSION="[^"]*\)"/\1-Lotus"/' "$DEFCONFIG"
           echo "Updating KernelSU configuration..."
-          echo "CONFIG_KSU=y" >> "$DEFCONFIG"
-          echo "CONFIG_KPM=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_SUS_SU=${{ inputs.VFS == 'enable' && 'n' || 'y' }}" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_MANUAL_HOOK=${{ inputs.VFS == 'enable' && 'y' || 'n' }}" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_WITH_KPROBES=n" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$DEFCONFIG"
-          echo "CONFIG_KSU_SUSFS_SUS_SU=n" >> "$DEFCONFIG"
-          echo "CONFIG_TMPFS_XATTR=y" >> "$DEFCONFIG"
-          echo "CONFIG_TMPFS_POSIX_ACL=y" >> "$DEFCONFIG"
-          echo "CONFIG_WIREGUARD=y" >> "$DEFCONFIG"
-          echo "CONFIG_IP_NF_NAT=y" >> "$DEFCONFIG"
-          echo "CONFIG_IP_NF_TARGET_TTL=y" >> "$DEFCONFIG"
-          echo "CONFIG_IP6_NF_TARGET_HL=y" >> "$DEFCONFIG"
-          echo "CONFIG_IP6_NF_MATCH_HL=y" >> "$DEFCONFIG"
-          echo "CONFIG_DEBUG_KERNEL=n" >> "$DEFCONFIG"
-          echo "CONFIG_DYNAMIC_DEBUG=n" >> "$DEFCONFIG"
-          echo "CONFIG_DEBUG_INFO=n" >> "$DEFCONFIG"
-          echo "CONFIG_TCP_CONG_ADVANCED=y" >> "$DEFCONFIG"
-          echo "CONFIG_TCP_CONG_BBR=y" >> "$DEFCONFIG"
-          echo "CONFIG_DEFAULT_TCP_CONG=\"bbr\"" >> "$DEFCONFIG"
-          echo "CONFIG_TCP_CONG_CDG=y" >> "$DEFCONFIG"
-          echo "CONFIG_DEFAULT_BBR=y" >> "$DEFCONFIG"
-          echo "CONFIG_DEFAULT_CUBIC=n" >> "$DEFCONFIG"
-          echo "CONFIG_DEFAULT_CDG=n" >> "$DEFCONFIG"
-          echo "CONFIG_NET_SCH_DEFAULT=y" >> "$DEFCONFIG"
-          echo "CONFIG_DEFAULT_FQ=y" >> "$DEFCONFIG"
-          echo 'CONFIG_DEFAULT_NET_SCH="fq"' >> "$DEFCONFIG"
-          echo "CONFIG_NET_SCH_HTB=y" >> "$DEFCONFIG"
-          echo "CONFIG_NET_SCH_PRIO=y" >> "$DEFCONFIG"
-          echo "CONFIG_NET_SCH_SFQ=y" >> "$DEFCONFIG"
-          echo "CONFIG_NET_SCH_TBF=y" >> "$DEFCONFIG"
-          echo "CONFIG_TCP_CONG_BIC=n" >> "$DEFCONFIG"
-          echo "CONFIG_TCP_CONG_WESTWOOD=n" >> "$DEFCONFIG"
-          echo "CONFIG_TCP_CONG_HTCP=y" >> "$DEFCONFIG"
-          echo "CONFIG_IP_NF_TARGET_ECN=y" >> "$DEFCONFIG"
-          echo "CONFIG_IP_ECN=y" >> "$DEFCONFIG"
-          echo "CONFIG_TCP_ECN=y" >> "$DEFCONFIG"
-          echo "CONFIG_IPV6_ECN=y" >> "$DEFCONFIG"
-          echo "KernelSU configuration updated successfully"
+          if [ ! -f "$DEFCONFIG" ]; then
+            echo "Error: gki_defconfig not found at $DEFCONFIG"
+            ls -la "$COMMON/arch/arm64/configs/"
+            exit 1
+          fi
+          cat >> "$DEFCONFIG" << 'EOF'
+CONFIG_KSU=y
+CONFIG_KPM=y
+CONFIG_KSU_SUSFS_SUS_SU=${{ inputs.VFS == 'enable' && 'n' || 'y' }}
+CONFIG_KSU_MANUAL_HOOK=${{ inputs.VFS == 'enable' && 'y' || 'n' }}
+CONFIG_KSU_WITH_KPROBES=n
+CONFIG_KSU_SUSFS=y
+CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
+CONFIG_KSU_SUSFS_SUS_PATH=y
+CONFIG_KSU_SUSFS_SUS_MOUNT=y
+CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+CONFIG_KSU_SUSFS_SUS_KSTAT=y
+CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n
+CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+CONFIG_KSU_SUSFS_ENABLE_LOG=y
+CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+CONFIG_KSU_SUSFS_SUS_SU=n
+CONFIG_TMPFS_XATTR=y
+CONFIG_TMPFS_POSIX_ACL=y
+CONFIG_WIREGUARD=y
+CONFIG_IP_NF_NAT=y
+CONFIG_IP_NF_TARGET_TTL=y
+CONFIG_IP6_NF_TARGET_HL=y
+CONFIG_IP6_NF_MATCH_HL=y
+CONFIG_DEBUG_KERNEL=n
+CONFIG_DYNAMIC_DEBUG=n
+CONFIG_DEBUG_INFO=n
+CONFIG_TCP_CONG_ADVANCED=y
+CONFIG_TCP_CONG_BBR=y
+CONFIG_DEFAULT_TCP_CONG="bbr"
+CONFIG_TCP_CONG_CDG=y
+CONFIG_DEFAULT_BBR=y
+CONFIG_DEFAULT_CUBIC=n
+CONFIG_DEFAULT_CDG=n
+CONFIG_NET_SCH_DEFAULT=y
+CONFIG_DEFAULT_FQ=y
+CONFIG_DEFAULT_NET_SCH="fq"
+CONFIG_NET_SCH_HTB=y
+CONFIG_NET_SCH_PRIO=y
+CONFIG_NET_SCH_SFQ=y
+CONFIG_NET_SCH_TBF=y
+CONFIG_TCP_CONG_BIC=n
+CONFIG_TCP_CONG_WESTWOOD=n
+CONFIG_TCP_CONG_HTCP=y
+CONFIG_IP_NF_TARGET_ECN=y
+CONFIG_IP_ECN=y
+CONFIG_TCP_ECN=y
+CONFIG_IPV6_ECN=y
+EOF
+          echo "Verifying gki_defconfig updates..."
+          tail -n 50 "$DEFCONFIG"
           cd "$COMMON"
           git status
-          cat "$DEFCONFIG"
 
       - name: Add sched_ext
         run: |
@@ -311,40 +360,64 @@ jobs:
       - name: Build Kernel
         run: |
           cd "$WORKSPACE"
+          sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
+          rm -rf /tmp/* ~/.cache/* || echo "No temp files to clear"
+          df -h
           BUILD_TYPE="gki"
           if [ "${{ inputs.Chipset }}" == "sun" ]; then
             BUILD_TYPE="perf"
           fi
           echo "Starting kernel build, build type: $BUILD_TYPE"
-          LTO=thin ./kernel_platform/oplus/build/oplus_build_kernel.sh ${{ inputs.Chipset }} "$BUILD_TYPE" --jobs=$(nproc --all) || { echo "Kernel build failed"; exit 1; }
+          (stdbuf -oL bash -c '
+            while true; do
+              echo "=== $(date) ==="
+              free -h
+              echo "======"
+              df -h
+              echo "======"
+              top -b -n 1 | head -n 15
+              echo ""
+              AVAILABLE_SPACE=$(df -B1 / | tail -1 | awk "{print \$4}")
+              if [ "$AVAILABLE_SPACE" -lt 2147483648 ]; then
+                echo "Error: Less than 2GB free space remaining"
+                exit 1
+              fi
+              sleep 30
+            done
+          ') &
+          MONITOR_PID=$!
+          trap "kill $MONITOR_PID" EXIT
+          LTO=thin ./kernel_platform/oplus/build/oplus_build_kernel.sh ${{ inputs.Chipset }} "$BUILD_TYPE" --jobs=4 || { echo "Error: Kernel build failed"; exit 1; }
 
       - name: Make AnyKernel3
         run: |
           cd "$WORKSPACE"
           mkdir -p image_output
-          git clone https://github.com/schqiushui/AnyKernel3-KernelSU-Next.git -b gki-2.0 --depth=1 && rm -rf ./AnyKernel3-KernelSU-Next/.git
+          git clone https://github.com/schqiushui/AnyKernel3-KernelSU-Next.git -b gki-2.0 --depth=1 || { echo "Error: Failed to clone AnyKernel3"; exit 1; }
+          rm -rf ./AnyKernel3-KernelSU-Next/.git
           IMAGE_PATH=$(find "$PLATFORM/out" -name "Image")
           if [ -n "$IMAGE_PATH" ]; then
-            cp "$IMAGE_PATH" "$WORKSPACE/AnyKernel3-KernelSU-Next/Image"
-            cp "$IMAGE_PATH" "$WORKSPACE/image_output/Image"
+            cp "$IMAGE_PATH" "$WORKSPACE/AnyKernel3-KernelSU-Next/Image" || { echo "Error: Failed to copy Image"; exit 1; }
+            cp "$IMAGE_PATH" "$WORKSPACE/image_output/Image" || { echo "Error: Failed to copy Image to image_output"; exit 1; }
             echo "Image file found: $IMAGE_PATH"
           else
-            echo "Image file not found"
+            echo "Error: Image file not found"
+            ls -la "$PLATFORM/out"
             exit 1
           fi
           if [[ "${{ env.KERNEL_VERSION }}" == "6.6" && "${{ inputs.FILE }}" != "oneplus_13t" ]]; then
             readarray -d '' DTBO_FILES < <(find device/ -type f -name '*dtbo.img' -print0)
             if [ ${#DTBO_FILES[@]} -gt 0 ]; then
-                cp "${DTBO_FILES[@]}" "$WORKSPACE/image_output/"
-                echo "Copied the following files to image_output/:"
-                printf "%s\n" "${DTBO_FILES[@]}"
+              cp "${DTBO_FILES[@]}" "$WORKSPACE/image_output/" || { echo "Error: Failed to copy dtbo.img files"; exit 1; }
+              echo "Copied the following files to image_output/:"
+              printf "%s\n" "${DTBO_FILES[@]}"
             else
-                echo "No dtbo.img files found"
+              echo "No dtbo.img files found"
             fi
           fi
           BOOTIMG_PATH=$(find "$PLATFORM/out" -name "boot.img")
           if [ -n "$BOOTIMG_PATH" ]; then
-            cp "$BOOTIMG_PATH" "$WORKSPACE/image_output/boot.img"
+            cp "$BOOTIMG_PATH" "$WORKSPACE/image_output/boot.img" || { echo "Error: Failed to copy boot.img"; exit 1; }
             echo "boot.img file found: $BOOTIMG_PATH"
           else
             echo "boot.img file not found, skipping copy"
@@ -354,10 +427,10 @@ jobs:
         if: ${{ inputs.KPM == 'enable' }}
         run: |
           cd "$WORKSPACE/image_output"
-          curl -LO https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.11-beta/patch_linux
+          curl -LO https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.11-beta/patch_linux || { echo "Error: Failed to download patch_linux"; exit 1; }
           chmod +x patch_linux
-          ./patch_linux || { echo "Applying patch_linux failed"; exit 1; }
-          cp oImage "$WORKSPACE/AnyKernel3-KernelSU-Next/Image"
+          ./patch_linux || { echo "Error: Applying patch_linux failed"; exit 1; }
+          cp oImage "$WORKSPACE/AnyKernel3-KernelSU-Next/Image" || { echo "Error: Failed to copy patched Image"; exit 1; }
           echo "Patched Image file replaced successfully"
 
       - name: Get Formatted Date
