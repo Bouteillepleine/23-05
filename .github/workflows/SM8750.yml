@@ -157,7 +157,7 @@ jobs:
       - name: OnePlus
         run: |
           set -x
-          cd "$CONFIG/kernel_platform/common"
+          cd "$COMMON_DIR"
           if [ ! -f "arch/arm64/configs/gki_defconfig" ]; then
             echo "Error: gki_defconfig not found"
             exit 1
@@ -328,7 +328,7 @@ jobs:
       - name: Add sched_ext
         run: |
           set -x
-          cd "$CPLATFORM_DIR"
+          cd "$PLATFORM_DIR"
           git clone https://github.com/egcd123/sched_ext.git || { echo "Error: Failed to clone sched_ext"; exit 1; }
           cp -r ./sched_ext/* ./common/kernel/sched || { echo "Error: Failed to copy sched_ext files"; exit 1; }
           rm -rf ./sched_ext/.git
