@@ -409,4 +409,3 @@ jobs:
           name: kernel-${{ env.CONFIG }}
           path: |
             *.zip
-```
