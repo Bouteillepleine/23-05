@@ -7,7 +7,6 @@ on:
         description: "SoC to build"
         required: true
         default: 'sm8750'
-
       FILE:
         description: "Configuration file name"
         required: true
@@ -17,22 +16,18 @@ on:
           - oneplus_13t
           - oneplus_ace5_pro
         default: oneplus_13
-
       Chipset:
         description: "Chipset codename"
         required: true
         default: 'sun'
-
       VERSION:
         description: "Format: android15-6.6 [Android version-kernel version]"
         required: true
         default: 'android15-6.6'
-
       KERNEL_NAME:
         description: "Kernel name suffix"
         required: true
         default: '-android15-8-g013ec21bba94-abogki383916444'
-
       KSU_CONFIG:
         description: "Select KernelSU configuration"
         required: true
@@ -42,7 +37,6 @@ on:
           - SukiSU_dev
           - SukiSU_stable
         default: SukiSU_dev
-
       SUSFS:
         description: "Enable SUSFS"
         required: true
@@ -51,7 +45,6 @@ on:
           - enable
           - disable
         default: enable
-
       VFS:
         description: "Enable VFS patch (new hooks)"
         required: true
@@ -60,7 +53,6 @@ on:
           - enable
           - disable
         default: enable
-
       KPM:
         description: "Enable kernel patched modules"
         required: true
@@ -85,43 +77,35 @@ jobs:
       - name: Parse Device Name
         run: |
           FILE="${{ inputs.FILE }}"
-
           # Remove trailing _v (if present)
           BASE_NAME="${FILE%_u}"
           BASE_NAME="${BASE_NAME%_v}"
-
           # Extract brand (part before the first underscore)
           RAW_BRAND="${BASE_NAME%%_*}"
-
           # Extract model (all parts after the brand)
           MODEL="${BASE_NAME#*_}"
           MODEL="${MODEL//_/ }"  # Replace underscores with spaces, e.g., ace5_pro -> ace5 pro
-
-          # Brand mapping: Capitalize first letter or custom mapping
           case "$RAW_BRAND" in
             oneplus) BRAND="OnePlus" ;;
             oppo)    BRAND="OPPO" ;;
-            *)       BRAND="$(echo "$RAW_BRAND" | sed 's/.*/\u&/')" ;;  # Default: capitalize first letter
+            *)       BRAND="$(echo "$RAW_BRAND" | sed 's/.*/\u&/')" ;;
           esac
-
           echo "BRAND=${BRAND}" >> $GITHUB_ENV
           echo "MODEL=${MODEL}" >> $GITHUB_ENV
           echo "Device: ${BRAND} ${MODEL}"
 
-      - name: Set Environment Variable
+      - name: Set Environment Variables
         run: |
           WORKSPACE_DIR="$GITHUB_WORKSPACE/kernel_workspace"
           PLATFORM_DIR="$WORKSPACE_DIR/kernel_platform"
           COMMON_DIR="$PLATFORM_DIR/common"
           DEFCONFIG="$COMMON_DIR/arch/arm64/configs/gki_defconfig"
-
-          # Set working DIR as an environment variable for future steps
           echo "WORKSPACE=$WORKSPACE_DIR" >> $GITHUB_ENV
           echo "PLATFORM=$PLATFORM_DIR" >> $GITHUB_ENV
           echo "COMMON=$COMMON_DIR" >> $GITHUB_ENV
           echo "DEFCONFIG=$DEFCONFIG" >> $GITHUB_ENV
 
-      - name: Maximize build space
+      - name: Maximize Build Space
         uses: easimon/maximize-build-space@master
         with:
           root-reserve-mb: 8192
@@ -132,7 +116,7 @@ jobs:
           remove-haskell: 'true'
           remove-codeql: 'true'
 
-      - name: Configure Git & Install dependencies
+      - name: Configure Git & Install Dependencies
         run: |
           git config --global user.name "Build_O+"
           git config --global user.email "builder@opluskernel.org"
@@ -141,25 +125,40 @@ jobs:
           sudo apt upgrade -y -o Dpkg::Options::="--force-confold"
           sudo apt install -y python3 git git-lfs curl && git lfs install
 
-      - name: Install repo tool
+      - name: Install Repo Tool
         run: |
-          curl -sSL https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
-          chmod a+x ~/repo
-          sudo mv ~/repo /usr/local/bin/repo
+          mkdir -p ./git-repo
+          curl -sSL https://storage.googleapis.com/git-repo-downloads/repo > ./git-repo/repo
+          chmod a+rx ./git-repo/repo
+          echo "REPO=$GITHUB_WORKSPACE/./git-repo/repo" >> $GITHUB_ENV
 
-      - name: Initialize repo and sync
+      - name: Initialize Repo and Sync
         run: |
-          mkdir "$WORKSPACE" && cd "$WORKSPACE"
-          repo init -u https://github.com/OnePlusOSS/kernel_manifest.git -b refs/heads/oneplus/${{ inputs.SoC }} -m ${{ inputs.FILE }}.xml --depth=1 || { echo "repo init failed"; exit 1; }
-          repo sync -c -j$(nproc --all) --no-tags || { echo "repo sync failed"; exit 1; }
-          git clone https://gitlab.com/kei-space/clang/r522817.git $PLATFORM/prebuilts/clang/host/linux-x86/clang-r522817
+          set -x
+          mkdir -p "$WORKSPACE" && cd "$WORKSPACE"
+          ${{ env.REPO }} init -u https://github.com/OnePlusOSS/kernel_manifest.git -b refs/heads/oneplus/${{ inputs.SoC }} -m ${{ inputs.FILE }}.xml --depth=1 || { echo "repo init failed"; exit 1; }
+          ${{ env.REPO }} sync -c -j$(nproc --all) --no-tags || { echo "repo sync failed"; exit 1; }
+          git clone --depth=1 https://gitlab.com/kei-space/clang/r522817.git "$PLATFORM/prebuilts/clang/host/linux-x86/clang-r522817" || { echo "Clang clone failed"; exit 1; }
+          echo "Listing contents of $COMMON to verify structure:"
+          ls -la "$COMMON" || echo "Warning: $COMMON directory not found or empty"
 
       - name: OnePlus
         run: |
           set -x
-          cd "$COMMON_DIR"
+          echo "Changing to COMMON directory: $COMMON"
+          if [ -z "$COMMON" ]; then
+            echo "Error: COMMON environment variable is unset"
+            exit 1
+          fi
+          if [ ! -d "$COMMON" ]; then
+            echo "Error: Directory $COMMON does not exist"
+            ls -la "$(dirname "$COMMON")"
+            exit 1
+          fi
+          cd "$COMMON"
           if [ ! -f "arch/arm64/configs/gki_defconfig" ]; then
-            echo "Error: gki_defconfig not found"
+            echo "Error: gki_defconfig not found in $COMMON/arch/arm64/configs/"
+            ls -la arch/arm64/configs/
             exit 1
           fi
           chmod 644 arch/arm64/configs/gki_defconfig
@@ -174,7 +173,7 @@ jobs:
           fi
           echo "oplus applied"
 
-      - name: Get KernelSU version
+      - name: Get KernelSU Version
         if: ${{ startsWith(inputs.KSU_CONFIG, 'SukiSU') }}
         run: |
           echo "KSU_TYPE=$(echo '${{ inputs.KSU_CONFIG }}' | cut -d'_' -f1)" >> $GITHUB_ENV
@@ -184,12 +183,11 @@ jobs:
             echo "SukiSU_BRANCH=susfs-stable" >> $GITHUB_ENV
           fi
 
-      - name: SukiSU setup
+      - name: SukiSU Setup
         if: ${{ startsWith(inputs.KSU_CONFIG, 'SukiSU') }}
         run: |
           cd "$PLATFORM"
           curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s ${{ env.SukiSU_BRANCH }}
-
           cd ./KernelSU
           KSU_VERSION=$(expr $(/usr/bin/git rev-list --count main) "+" 10606)
           echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
@@ -197,35 +195,25 @@ jobs:
           sed -i "s/DKSU_VERSION=12800/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
           echo "KernelSU version: $KSU_VERSION"
 
-      - name: Apply SUSFS & Hide patches
+      - name: Apply SUSFS & Hide Patches
         if: ${{ startsWith(inputs.KSU_CONFIG, 'SukiSU') && inputs.SUSFS == 'enable' }}
         run: |
           cd "$WORKSPACE"
           git clone https://github.com/SukiSU-Ultra/SukiSU_patch.git
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
-
-          # Copy patches
           cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch "$COMMON/"
           cp ./susfs4ksu/kernel_patches/fs/* "$COMMON/fs/"
           cp ./susfs4ksu/kernel_patches/include/linux/* "$COMMON/include/linux/"
           cp ./SukiSU_patch/69_hide_stuff.patch "$COMMON/"
-
-          # Patches apply
           cd "$COMMON"
           echo "Applying susfs patch to kernel..."
-
-          if [[ "${{ env.KERNEL_VERSION }}" == "6.6" && "${{ inputs.FILE }}" != "oneplus_13t_v" ]]; then
+          if [[ "${{ env.KERNEL_VERSION }}" == "6.6" && "${{ inputs.FILE }}" != "oneplus_13t" ]]; then
             sed -i '/#include <trace\/hooks\/blk.h>/a #include <trace/hooks/fs.h>' ./fs/namespace.c
           fi
-
           patch -p1 < "50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch" || { echo "Applying susfs patch failed"; exit 1; }
           echo "susfs patch applied successfully"
 
-          #echo "Applying hide app patch..."
-          #patch -p1 -F 3 < "69_hide_stuff.patch" || { echo "Applying hide app patch failed"; exit 1; }
-          #echo "Hide app patch applied successfully"
-
-      - name: Apply New Hooks patches
+      - name: Apply New Hooks Patches
         if: ${{ startsWith(inputs.KSU_CONFIG, 'SukiSU') && inputs.VFS == 'enable' }}
         run: |
           cd "$WORKSPACE"
@@ -235,21 +223,16 @@ jobs:
             echo "SukiSU_patch directory already exists, skipping clone."
           fi
           cp ./SukiSU_patch/hooks/syscall_hooks.patch "$COMMON/"
-
           cd "$COMMON"
           echo "Applying vfs patch..."
           patch -p1 -F 3 < "syscall_hooks.patch" || { echo "Applying vfs patch failed"; exit 1; }
           echo "vfs patch applied successfully"
 
-      - name: Configure kernel
+      - name: Configure Kernel
         run: |
           cd "$WORKSPACE"
-
-          # Remove protected exports and strings
           rm $PLATFORM/common/android/abi_gki_protected_exports_* || echo "No protected exports!"
           rm $PLATFORM/msm-kernel/android/abi_gki_protected_exports_* || echo "No protected exports!"
-
-          # Adjust localversion strings
           sed -i 's/check_defconfig//' "$PLATFORM/common/build.config.gki"
           sed -i 's/ -dirty//g' "$PLATFORM/common/scripts/setlocalversion"
           sed -i 's/ -dirty//g' "$PLATFORM/msm-kernel/scripts/setlocalversion"
@@ -257,70 +240,60 @@ jobs:
           sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" "$PLATFORM/build/kernel/kleaf/impl/stamp.bzl"
           sed -i '/KMI_GENERATION/s/-$oki_infix//g' "$PLATFORM/build/kernel/kleaf/impl/stamp.bzl"
           sed -i 's/^\(CONFIG_LOCALVERSION="[^"]*\)"/\1-Lotus"/' "$DEFCONFIG"
-
-          # Replace kernel name strings
-          #echo "Setting kernel name..."
-          #sed -i '$s|echo "\$res"|echo "\${{ inputs.KERNEL_NAME }}"|' "$COMMON/scripts/setlocalversion"
-          #echo "Kernel name set successfully"
-
-          # Set KSU config to gki_defconfig
           echo "Updating KernelSU configuration..."
           echo "CONFIG_KSU=y" >> "$DEFCONFIG"
           echo "CONFIG_KPM=y" >> "$DEFCONFIG"
           echo "CONFIG_KSU_SUSFS_SUS_SU=${{ inputs.VFS == 'enable' && 'n' || 'y' }}" >> "$DEFCONFIG"
           echo "CONFIG_KSU_MANUAL_HOOK=${{ inputs.VFS == 'enable' && 'y' || 'n' }}" >> "$DEFCONFIG"
-
-          # Use Configs
-          echo "CONFIG_KSU_WITH_KPROBES=n" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_KSU_SUSFS_SUS_SU=n" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_TMPFS_XATTR=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_TMPFS_POSIX_ACL=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_WIREGUARD=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_NF_NAT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_NF_TARGET_TTL=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP6_NF_TARGET_HL=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP6_NF_MATCH_HL=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_DEBUG_KERNEL=n" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_DYNAMIC_DEBUG=n" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_DEBUG_INFO=n" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_TCP_CONG_ADVANCED=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_TCP_CONG_BBR=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_DEFAULT_TCP_CONG=\"bbr\"" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_TCP_CONG_CDG=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_DEFAULT_BBR=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_DEFAULT_CUBIC=n" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_DEFAULT_CDG=n" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_NET_SCH_DEFAULT=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_DEFAULT_FQ=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo 'CONFIG_DEFAULT_NET_SCH="fq"' >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_NET_SCH_HTB=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_NET_SCH_PRIO=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_NET_SCH_SFQ=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_NET_SCH_TBF=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_TCP_CONG_BIC=n" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_TCP_CONG_WESTWOOD=n" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_TCP_CONG_HTCP=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_NF_TARGET_ECN=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IP_ECN=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_TCP_ECN=y" >> ./common/arch/arm64/configs/gki_defconfig
-          echo "CONFIG_IPV6_ECN=y" >> ./common/arch/arm64/configs/gki_defconfig         
+          echo "CONFIG_KSU_WITH_KPROBES=n" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$DEFCONFIG"
+          echo "CONFIG_KSU_SUSFS_SUS_SU=n" >> "$DEFCONFIG"
+          echo "CONFIG_TMPFS_XATTR=y" >> "$DEFCONFIG"
+          echo "CONFIG_TMPFS_POSIX_ACL=y" >> "$DEFCONFIG"
+          echo "CONFIG_WIREGUARD=y" >> "$DEFCONFIG"
+          echo "CONFIG_IP_NF_NAT=y" >> "$DEFCONFIG"
+          echo "CONFIG_IP_NF_TARGET_TTL=y" >> "$DEFCONFIG"
+          echo "CONFIG_IP6_NF_TARGET_HL=y" >> "$DEFCONFIG"
+          echo "CONFIG_IP6_NF_MATCH_HL=y" >> "$DEFCONFIG"
+          echo "CONFIG_DEBUG_KERNEL=n" >> "$DEFCONFIG"
+          echo "CONFIG_DYNAMIC_DEBUG=n" >> "$DEFCONFIG"
+          echo "CONFIG_DEBUG_INFO=n" >> "$DEFCONFIG"
+          echo "CONFIG_TCP_CONG_ADVANCED=y" >> "$DEFCONFIG"
+          echo "CONFIG_TCP_CONG_BBR=y" >> "$DEFCONFIG"
+          echo "CONFIG_DEFAULT_TCP_CONG=\"bbr\"" >> "$DEFCONFIG"
+          echo "CONFIG_TCP_CONG_CDG=y" >> "$DEFCONFIG"
+          echo "CONFIG_DEFAULT_BBR=y" >> "$DEFCONFIG"
+          echo "CONFIG_DEFAULT_CUBIC=n" >> "$DEFCONFIG"
+          echo "CONFIG_DEFAULT_CDG=n" >> "$DEFCONFIG"
+          echo "CONFIG_NET_SCH_DEFAULT=y" >> "$DEFCONFIG"
+          echo "CONFIG_DEFAULT_FQ=y" >> "$DEFCONFIG"
+          echo 'CONFIG_DEFAULT_NET_SCH="fq"' >> "$DEFCONFIG"
+          echo "CONFIG_NET_SCH_HTB=y" >> "$DEFCONFIG"
+          echo "CONFIG_NET_SCH_PRIO=y" >> "$DEFCONFIG"
+          echo "CONFIG_NET_SCH_SFQ=y" >> "$DEFCONFIG"
+          echo "CONFIG_NET_SCH_TBF=y" >> "$DEFCONFIG"
+          echo "CONFIG_TCP_CONG_BIC=n" >> "$DEFCONFIG"
+          echo "CONFIG_TCP_CONG_WESTWOOD=n" >> "$DEFCONFIG"
+          echo "CONFIG_TCP_CONG_HTCP=y" >> "$DEFCONFIG"
+          echo "CONFIG_IP_NF_TARGET_ECN=y" >> "$DEFCONFIG"
+          echo "CONFIG_IP_ECN=y" >> "$DEFCONFIG"
+          echo "CONFIG_TCP_ECN=y" >> "$DEFCONFIG"
+          echo "CONFIG_IPV6_ECN=y" >> "$DEFCONFIG"
           echo "KernelSU configuration updated successfully"
-
           cd "$COMMON"
           git status
           cat "$DEFCONFIG"
@@ -328,22 +301,20 @@ jobs:
       - name: Add sched_ext
         run: |
           set -x
-          cd "$PLATFORM_DIR"
+          cd "$PLATFORM"
           git clone https://github.com/egcd123/sched_ext.git || { echo "Error: Failed to clone sched_ext"; exit 1; }
           cp -r ./sched_ext/* ./common/kernel/sched || { echo "Error: Failed to copy sched_ext files"; exit 1; }
           rm -rf ./sched_ext/.git
           cd common/kernel/sched
           sed -i.bak '/# include "ext.c"/a\# include "hmbird_sched_proc_main.c"\n#endif\n\n#ifdef CONFIG_SLIM_SCHED\n# include "slim_sysctl.c"' build_policy.c
 
-      - name: Build kernel
+      - name: Build Kernel
         run: |
           cd "$WORKSPACE"
-
           BUILD_TYPE="gki"
           if [ "${{ inputs.Chipset }}" == "sun" ]; then
             BUILD_TYPE="perf"
           fi
-
           echo "Starting kernel build, build type: $BUILD_TYPE"
           LTO=thin ./kernel_platform/oplus/build/oplus_build_kernel.sh ${{ inputs.Chipset }} "$BUILD_TYPE" --jobs=$(nproc --all) || { echo "Kernel build failed"; exit 1; }
 
@@ -351,11 +322,7 @@ jobs:
         run: |
           cd "$WORKSPACE"
           mkdir -p image_output
-
-          # Clone AnyKernel3
           git clone https://github.com/schqiushui/AnyKernel3-KernelSU-Next.git -b gki-2.0 --depth=1 && rm -rf ./AnyKernel3-KernelSU-Next/.git
-
-          # Copy kernel
           IMAGE_PATH=$(find "$PLATFORM/out" -name "Image")
           if [ -n "$IMAGE_PATH" ]; then
             cp "$IMAGE_PATH" "$WORKSPACE/AnyKernel3-KernelSU-Next/Image"
@@ -365,11 +332,8 @@ jobs:
             echo "Image file not found"
             exit 1
           fi
-
-          # Copy dtbo.img
-          if [[ "${{ env.KERNEL_VERSION }}" == "6.6" && "${{ inputs.FILE }}" != "oneplus_13t_v" ]]; then
+          if [[ "${{ env.KERNEL_VERSION }}" == "6.6" && "${{ inputs.FILE }}" != "oneplus_13t" ]]; then
             readarray -d '' DTBO_FILES < <(find device/ -type f -name '*dtbo.img' -print0)
-
             if [ ${#DTBO_FILES[@]} -gt 0 ]; then
                 cp "${DTBO_FILES[@]}" "$WORKSPACE/image_output/"
                 echo "Copied the following files to image_output/:"
@@ -378,8 +342,6 @@ jobs:
                 echo "No dtbo.img files found"
             fi
           fi
-
-          # Copy boot.img
           BOOTIMG_PATH=$(find "$PLATFORM/out" -name "boot.img")
           if [ -n "$BOOTIMG_PATH" ]; then
             cp "$BOOTIMG_PATH" "$WORKSPACE/image_output/boot.img"
@@ -388,21 +350,20 @@ jobs:
             echo "boot.img file not found, skipping copy"
           fi
 
-      - name: Apply patch_linux and replace Image
+      - name: Apply patch_linux and Replace Image
         if: ${{ inputs.KPM == 'enable' }}
         run: |
           cd "$WORKSPACE/image_output"
           curl -LO https://github.com/SukiSU-Ultra/SukiSU_KernelPatch_patch/releases/download/0.11-beta/patch_linux
           chmod +x patch_linux
           ./patch_linux || { echo "Applying patch_linux failed"; exit 1; }
-
           cp oImage "$WORKSPACE/AnyKernel3-KernelSU-Next/Image"
           echo "Patched Image file replaced successfully"
 
-      - name: Get formatted date
+      - name: Get Formatted Date
         id: formatted_date
         run: |
-          DATE=$(date +'%y%m%d-%H%M')
+          DATE=$(date -u +'%y%m%d-%H%M')
           echo "formatted=$DATE" >> $GITHUB_OUTPUT
 
       - name: Upload AnyKernel3
@@ -422,7 +383,7 @@ jobs:
           cd "$WORKSPACE/AnyKernel3-KernelSU-Next"
           zip -r "$WORKSPACE/AnyKernel3-${{ inputs.FILE }}-SukiSU-${{ env.KSUVER }}-${{ steps.formatted_date.outputs.formatted }}.zip" *
 
-      - name: Create Release version and upload
+      - name: Create Release and Upload
         uses: softprops/action-gh-release@v2
         with:
           name: "Kernel Release: ${{ env.BRAND }}-${{ env.MODEL }}-${{ steps.formatted_date.outputs.formatted }}"
