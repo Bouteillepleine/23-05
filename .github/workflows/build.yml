@@ -73,6 +73,7 @@ jobs:
           curl -sSL https://storage.googleapis.com/git-repo-downloads/repo > ./git-repo/repo
           chmod a+rx ./git-repo/repo
           echo "REPO=$GITHUB_WORKSPACE/./git-repo/repo" >> $GITHUB_ENV
+          git clone https://gitlab.com/kei-space/clang/r522817.git $GITHUB_ENV/prebuilts/clang/host/linux-x86/clang-r522817
 
       - name: Set CONFIG Environment Variable
         run: |
