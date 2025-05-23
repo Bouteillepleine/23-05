@@ -1,4 +1,5 @@
 name: Build
+
 permissions:
   contents: write
   actions: write
@@ -29,6 +30,25 @@ jobs:
   build-kernel-oneplus-kernelsu-susfs:
     runs-on: ubuntu-latest
     steps:
+      - name: Validate Inputs
+        run: |
+          set -x
+          VALID_SOCS=("sun" "pineapple" "sm8650")
+          VALID_ANDROID_VERSIONS=("android14" "android15")
+          VALID_KERNEL_VERSIONS=("6.1" "6.6")
+          if [[ ! " ${VALID_SOCS[@]} " =~ " ${{ inputs.soc }} " ]]; then
+            echo "Error: Invalid soc: ${{ inputs.soc }}. Must be one of: ${VALID_SOCS[*]}"
+            exit 1
+          fi
+          if [[ ! " ${VALID_ANDROID_VERSIONS[@]} " =~ " ${{ inputs.android_version }} " ]]; then
+            echo "Error: Invalid android_version: ${{ inputs.android_version }}. Must be one of: ${VALID_ANDROID_VERSIONS[*]}"
+            exit 1
+          fi
+          if [[ ! " ${VALID_KERNEL_VERSIONS[@]} " =~ " ${{ inputs.kernel_version }} " ]]; then
+            echo "Error: Invalid kernel_version: ${{ inputs.kernel_version }}. Must be one of: ${VALID_KERNEL_VERSIONS[*]}"
+            exit 1
+          fi
+
       - name: Configure Git
         run: |
           git config --global user.name "OplusKernelBuilder"
@@ -38,22 +58,20 @@ jobs:
         uses: easimon/maximize-build-space@master
         with:
           root-reserve-mb: 16384
-          temp-reserve-mb: 4096
+          temp-reserve-mb: 8192
           swap-size-mb: 8192
           remove-dotnet: 'true'
           remove-android: 'true'
           remove-haskell: 'true'
           remove-codeql: 'true'
-          remove-powershell: 'true'
-          remove-swift: 'true'
 
       - name: Install Dependencies
         run: |
           export DEBIAN_FRONTEND=noninteractive
           echo "DEBIAN_FRONTEND=noninteractive" >> $GITHUB_ENV
-          sudo apt update
-          sudo apt install -y python3 python-is-python3 git curl patch
-          df -h
+          sudo apt update -y
+          sudo apt install -y python3 python-is-python3 git curl patch parallel bc > apt_install.log 2>&1 || { cat apt_install.log; echo "Error: apt install failed"; exit 1; }
+          df -h > disk_usage.log
 
       - name: Install Repo Tool
         run: |
@@ -63,74 +81,90 @@ jobs:
           sudo ln -sf $GITHUB_WORKSPACE/git-repo/repo /bin/repo
           echo "REPO=$GITHUB_WORKSPACE/./git-repo/repo" >> $GITHUB_ENV
           echo "PATH=$GITHUB_WORKSPACE/git-repo:$PATH" >> $GITHUB_ENV
-          /bin/repo --version
+          /bin/repo --version > repo_version.log
+
+      - name: Cache Clang Toolchain
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: kernel_workspace/kernel_platform/prebuilts/clang/host/linux-x86/clang-r522817
+          key: clang-r522817-${{ runner.os }}-${{ hashFiles('**/clang-r522817/**') }}
+          restore-keys: clang-r522817-${{ runner.os }}-
+
+      - name: Clone Clang Toolchain
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p kernel_workspace/kernel_platform/prebuilts/clang/host/linux-x86
+          git clone --depth=1 https://gitlab.com/kei-space/clang/r522817.git kernel_workspace/kernel_platform/prebuilts/clang/host/linux-x86/clang-r522817 || { echo "Error: Clang clone failed"; exit 1; }
+          echo "Clang toolchain cloned successfully" > clang_clone.log
+
+      - name: Cache Bazel Output
+        id: cache-bazel
+        uses: actions/cache@v4
+        with:
+          path: kernel_workspace/kernel_platform/out/bazel/cache
+          key: bazel-cache-${{ runner.os }}-${{ inputs.soc }}-${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ github.run_id }}
+          restore-keys: bazel-cache-${{ runner.os }}-${{ inputs.soc }}-${{ inputs.android_version }}-${{ inputs.kernel_version }}-
 
       - name: Set Environment Variables
         run: |
           set -x
-          CONFIG="${{ inputs.model }}"
           WORKSPACE_DIR="$GITHUB_WORKSPACE/kernel_workspace"
           PLATFORM_DIR="$WORKSPACE_DIR/kernel_platform"
           COMMON_DIR="$PLATFORM_DIR/common"
           DEFCONFIG="$COMMON_DIR/arch/arm64/configs/gki_defconfig"
-          echo "CONFIG=$CONFIG" >> $GITHUB_ENV
           echo "WORKSPACE=$WORKSPACE_DIR" >> $GITHUB_ENV
           echo "PLATFORM=$PLATFORM_DIR" >> $GITHUB_ENV
           echo "COMMON=$COMMON_DIR" >> $GITHUB_ENV
           echo "DEFCONFIG=$DEFCONFIG" >> $GITHUB_ENV
-          echo "CONFIG set to: $CONFIG"
+          echo "KSUVER=unknown" >> $GITHUB_ENV
+          echo "SUSFSVER=unknown" >> $GITHUB_ENV
+          echo "MODEL=${{ inputs.model }}" >> $GITHUB_ENV
           echo "WORKSPACE set to: $WORKSPACE_DIR"
           echo "PLATFORM set to: $PLATFORM_DIR"
 
       - name: Clone AnyKernel3 and Other Dependencies
         run: |
           set -x
-          echo "Cloning AnyKernel3 and other dependencies..."
           ANYKERNEL_BRANCH="gki-2.0"
           SUSFS_BRANCH="gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}"
-          echo "Using branch for AnyKernel3: $ANYKERNEL_BRANCH"
-          echo "Using branch for SUSFS: $SUSFS_BRANCH"
-          git clone https://github.com/TheWildJames/AnyKernel3.git -b "$ANYKERNEL_BRANCH" || { echo "Error: Failed to clone AnyKernel3"; exit 1; }
-          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH" || { echo "Error: Failed to clone susfs4ksu"; exit 1; }
-          git clone https://github.com/TheWildJames/kernel_patches.git || { echo "Error: Failed to clone kernel_patches"; exit 1; }
-          echo "Listing kernel_patches/next:"
-          ls -la kernel_patches/next/
+          echo "Cloning dependencies..." > clone_deps.log
+          git clone https://github.com/TheWildJames/AnyKernel3.git -b "$ANYKERNEL_BRANCH" AnyKernel3 || { echo "Error: Failed to clone AnyKernel3"; exit 1; } >> clone_deps.log
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH" susfs4ksu || { echo "Error: Failed to clone susfs4ksu"; exit 1; } >> clone_deps.log
+          git clone https://github.com/TheWildJames/kernel_patches.git kernel_patches || { echo "Error: Failed to clone kernel_patches"; exit 1; } >> clone_deps.log
+          ls -la kernel_patches/next/ >> clone_deps.log
 
       - name: Get SUSFS Version
         run: |
           set -x
-          if [ ! -f "susfs4ksu/kernel_patches/include/linux/susfs.h" ]; then
-            echo "Error: susfs.h not found in susfs4ksu"
+          SUSFS_HEADER="susfs4ksu/kernel_patches/include/linux/susfs.h"
+          if [ ! -f "$SUSFS_HEADER" ]; then
+            echo "Error: $SUSFS_HEADER not found"
+            ls -la susfs4ksu/kernel_patches/include/linux/
             exit 1
           fi
-          RAW_VERSION=$(grep -oP 'SUSFS_VERSION\s+"[^"]+"' susfs4ksu/kernel_patches/include/linux/susfs.h | grep -oP '"\K[^"]+')
+          RAW_VERSION=$(grep -oP 'SUSFS_VERSION\s+"[^"]+"' "$SUSFS_HEADER" | grep -oP '"\K[^"]+')
           SUSFS_VERSION=${RAW_VERSION#v}
           echo "SUSFSVER=$SUSFS_VERSION" >> $GITHUB_ENV
-          echo "🔹 Detected SUSFS version: $SUSFS_VERSION"
+          echo "🔹 Detected SUSFS version: $SUSFS_VERSION" > susfs_version.log
 
       - name: Initialize and Sync Kernel Source
         run: |
           set -x
-          echo "Creating folder for configuration: $CONFIG..."
-          mkdir -p "$CONFIG"
-          cd "$CONFIG"
-          echo "Initializing and syncing kernel source..."
+          mkdir -p "$WORKSPACE"
+          cd "$WORKSPACE"
           sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
           rm -rf /tmp/* ~/.cache/* || echo "No temp files to clear"
-          df -h
-          ${{ env.REPO }} init -u https://github.com/OnePlusOSS/kernel_manifest.git -b ${{ inputs.branch }} -m ${{ inputs.manifest }} --repo-rev=v2.16 --depth=1 --no-clone-bundle --no-tags || { echo "Error: repo init failed"; exit 1; }
-          echo "Manifest contents:"
-          cat ${{ inputs.manifest }} || echo "Manifest file not found"
-          ${{ env.REPO }} --version
+          df -h >> disk_usage.log
+          ${{ env.REPO }} init -u https://github.com/OnePlusOSS/kernel_manifest.git -b ${{ inputs.branch }} -m ${{ inputs.manifest }} --repo-rev=v2.16 --depth=1 --no-clone-bundle --no-tags || { echo "Error: repo init failed"; exit 1; } > repo_init.log 2>&1
+          echo "Manifest contents:" >> repo_init.log
+          cat ${{ inputs.manifest }} >> repo_init.log || echo "Manifest file not found" >> repo_init.log
           (stdbuf -oL bash -c '
             while true; do
               echo "=== $(date) ==="
               free -h
-              echo "======"
               df -h
-              echo "======"
               top -b -n 1 | head -n 15
-              echo ""
               AVAILABLE_SPACE=$(df -B1 / | tail -1 | awk "{print \$4}")
               if [ "$AVAILABLE_SPACE" -lt 2147483648 ]; then
                 echo "Error: Less than 2GB free space remaining"
@@ -138,19 +172,15 @@ jobs:
               fi
               sleep 30
             done
-          ') &
+          ') > disk_monitor.log 2>&1 &
           MONITOR_PID=$!
           trap "kill $MONITOR_PID" EXIT
-          ${{ env.REPO }} --trace sync -c --no-clone-bundle --no-tags --optimized-fetch -j4 --fail-fast || { echo "Error: repo sync failed"; exit 1; }
-          echo "Listing synced projects:"
+          ${{ env.REPO }} sync -c -j$(nproc) --no-clone-bundle --no-tags --optimized-fetch --force-sync --prune --fail-fast > repo_sync.log 2>&1 || { cat repo_sync.log; echo "Error: repo sync failed"; exit 1; }
           ${{ env.REPO }} list -f > repo_projects.txt
-          cat repo_projects.txt
-          echo "Verifying directory structure..."
-          ls -la "$PLATFORM" || { echo "Error: $PLATFORM directory not found"; exit 1; }
-          ls -la "$COMMON" || { echo "Error: $COMMON directory not found"; ls -la "$PLATFORM"; exit 1; }
-          echo "Cloning Clang toolchain..."
-          mkdir -p "$PLATFORM/prebuilts/clang/host/linux-x86"
-          git clone --depth=1 https://gitlab.com/kei-space/clang/r522817.git "$PLATFORM/prebuilts/clang/host/linux-x86/clang-r522817" || { echo "Error: Clang clone failed"; exit 1; }
+          ls -la "$PLATFORM" || { echo "Error: $PLATFORM directory not found"; exit 1; } >> repo_sync.log
+          ls -la "$COMMON" || { echo "Error: $COMMON directory not found"; ls -la "$PLATFORM"; exit 1; } >> repo_sync.log
+          rm $COMMON/android/abi_gki_protected_exports_* || echo "No protected exports!" >> repo_sync.log
+          rm $PLATFORM/msm-kernel/android/abi_gki_protected_exports_* || echo "No protected exports!" >> repo_sync.log
 
       - name: OnePlus
         run: |
@@ -162,24 +192,23 @@ jobs:
             exit 1
           fi
           chmod 644 arch/arm64/configs/gki_defconfig
-          echo "Current gki_defconfig content around line 67:"
-          sed -n '60,75p' arch/arm64/configs/gki_defconfig
+          echo "Current gki_defconfig content around line 67:" > oneplus_config.log
+          sed -n '60,75p' arch/arm64/configs/gki_defconfig >> oneplus_config.log
           sed -i 's/CONFIG_CMDLINE="\(.*\)"/CONFIG_CMDLINE="\1 module_blacklist=oplus_network_app_monitor,oplus_network_linkpower_module,oplus_network_vnet,oplus_network_score,oplus_network_qr_scan,oplus_network_game_first,oplus_network_sched,oplus_network_snapshot,oplus_network_tuning,oplus_network_data_module,oplus_network_stats_calc,oplus_network_dns_hook,oplus_connectivity_routerboost,oplus_connectivity_sla"/' arch/arm64/configs/gki_defconfig
-          echo "Updated gki_defconfig content around line 67:"
-          sed -n '50,100p' arch/arm64/configs/gki_defconfig
+          echo "Updated gki_defconfig content around line 67:" >> oneplus_config.log
+          sed -n '50,100p' arch/arm64/configs/gki_defconfig >> oneplus_config.log
           if ! grep -q 'module_blacklist=oplus_network_app_monitor' arch/arm64/configs/gki_defconfig; then
             echo "Error: Failed to apply module_blacklist to CONFIG_CMDLINE"
             exit 1
           fi
-          echo "oplus applied"
+          echo "oplus applied" >> oneplus_config.log
 
       - name: Add KernelSU-Next
         run: |
           set -x
           cd "$PLATFORM"
-          echo "Adding KernelSU-Next..."
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next-susfs-dev/kernel/setup.sh" | bash -s next || { echo "Error: Failed to run KernelSU-Next setup.sh"; exit 1; }
-          git submodule update --init --recursive || { echo "Error: Failed to update submodules"; exit 1; }
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next-susfs-dev/kernel/setup.sh" | bash -s next || { echo "Error: Failed to run KernelSU-Next setup.sh"; exit 1; } > kernelsu_setup.log 2>&1
+          git submodule update --init --recursive || { echo "Error: Failed to update submodules"; exit 1; } >> kernelsu_setup.log
           if [ ! -d "KernelSU-Next/kernel" ]; then
             echo "Error: KernelSU-Next/kernel directory not found"
             exit 1
@@ -187,194 +216,181 @@ jobs:
           cd KernelSU-Next/kernel
           KSU_VERSION=$(expr $(/usr/bin/git rev-list --count HEAD) "+" 10200)
           echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
-          echo "🔹 Detected KernelSU-Next version: $KSU_VERSION"
+          echo "🔹 Detected KernelSU-Next version: $KSU_VERSION" > kernelsu_version.log
           sed -i "s/DKSU_VERSION=11998/DKSU_VERSION=${KSU_VERSION}/" Makefile
 
       - name: Apply SUSFS Patches
         run: |
           set -x
           cd "$PLATFORM"
-          echo "Applying SUSFS patches..."
-          SUSFS_PATCH="../../susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}.patch"
+          SUSFS_PATCH="$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}.patch"
           if [ ! -f "$SUSFS_PATCH" ]; then
             echo "Error: SUSFS patch file $SUSFS_PATCH not found"
+            ls -la "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/"
             exit 1
           fi
           cp "$SUSFS_PATCH" ./common/ || { echo "Error: Failed to copy SUSFS patch"; exit 1; }
-          cp ../../susfs4ksu/kernel_patches/fs/* ./common/fs/ || { echo "Error: Failed to copy fs patches"; exit 1; }
-          cp ../../susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/ || { echo "Error: Failed to copy include patches"; exit 1; }
-          if [ ! -d "KernelSU-Next" ]; then
-            echo "Error: KernelSU-Next directory not found"
-            exit 1
-          fi
+          cp "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/fs/"* ./common/fs/ || { echo "Error: Failed to copy fs patches"; exit 1; }
+          cp "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/include/linux/"* ./common/include/linux/ || { echo "Error: Failed to copy include patches"; exit 1; }
           cd ./KernelSU-Next
           PATCH_URL="https://github.com/Bouteillepleine/kernel_patches/raw/main/next/0001-kernel-patch-susfs-v1.5.7-to-KernelSU-Next-v1.0.7.patch"
           PATCH_FILE="0001-kernel-patch-susfs-v1.5.7-to-KernelSU-Next-v1.0.7.patch"
-          echo "Downloading $PATCH_FILE..."
           curl -L -o "$PATCH_FILE" "$PATCH_URL" || { echo "Error: Failed to download patch"; exit 1; }
-          echo "Applying $PATCH_FILE..."
-          patch -p1 --fuzz=3 --verbose < "$PATCH_FILE" > patch.log 2>&1 || { cat patch.log; echo "Warning: Patch application failed or already applied, continuing..."; }
+          patch -p1 --fuzz=3 --verbose < "$PATCH_FILE" > susfs_kernelsu_patch.log 2>&1 || { cat susfs_kernelsu_patch.log; echo "Error: Failed to apply $PATCH_FILE"; exit 1; }
           cd ../common
           if [ "${{ inputs.soc }}" == "sun" ]; then
             sed -i '/#include <trace\/hooks\/blk.h>/a #include <trace/hooks/fs.h>' ./fs/namespace.c
           fi
-          echo "Applying 50_add_susfs_in_gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}.patch..."
-          patch -p1 --verbose < 50_add_susfs_in_gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}.patch > susfs_patch.log 2>&1 || { cat susfs_patch.log; echo "Warning: SUSFS patch application failed or already applied, continuing..."; }
+          patch -p1 --fuzz=3 --verbose < "50_add_susfs_in_gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}.patch" > susfs_patch.log 2>&1 || { cat susfs_patch.log; echo "Error: Failed to apply SUSFS patch"; exit 1; }
 
-      - name: Apply KernelSU-Next Hooks
+      - name: Apply KernelSU-Next Hooks and Hide Stuff Patches
         run: |
           set -x
           cd "$COMMON"
-          PATCH_FILE="syscall_hooks.patch"
-          PATCH_SRC="$GITHUB_WORKSPACE/kernel_patches/next/$PATCH_FILE"
-          if [ ! -f "$PATCH_SRC" ]; then
-            echo "Error: $PATCH_FILE not found in $PATCH_SRC"
-            ls -la "$GITHUB_WORKSPACE/kernel_patches/next/"
-            exit 1
-          fi
-          cp "$PATCH_SRC" ./ || { echo "Error: Failed to copy $PATCH_FILE"; exit 1; }
-          echo "Applying $PATCH_FILE..."
-          patch -p1 --fuzz=3 --verbose < "./$PATCH_FILE" > syscall_hooks.log 2>&1 || { cat syscall_hooks.log; echo "Warning: Patch application failed or already applied, continuing..."; }
+          PATCHES=(
+            "syscall_hooks.patch:$GITHUB_WORKSPACE/kernel_patches/next/syscall_hooks.patch:syscall_hooks.log"
+            "69_hide_stuff.patch:$GITHUB_WORKSPACE/kernel_patches/69_hide_stuff.patch:hide_stuff.log"
+          )
+          for PATCH in "${PATCHES[@]}"; do
+            PATCH_FILE=$(echo "$PATCH" | cut -d':' -f1)
+            PATCH_SRC=$(echo "$PATCH" | cut -d':' -f2)
+            LOG_FILE=$(echo "$PATCH" | cut -d':' -f3)
+            if [ ! -f "$PATCH_SRC" ]; then
+              echo "Error: $PATCH_FILE not found at $PATCH_SRC"
+              ls -la "$(dirname "$PATCH_SRC")"
+              exit 1
+            fi
+            cp "$PATCH_SRC" ./ || { echo "Error: Failed to copy $PATCH_FILE"; exit 1; }
+            echo "Applying $PATCH_FILE..." > "$LOG_FILE"
+            patch -p1 --fuzz=3 --verbose < "$PATCH_FILE" >> "$LOG_FILE" 2>&1 || { cat "$LOG_FILE"; echo "Error: Failed to apply $PATCH_FILE"; exit 1; } &
+          done
+          wait
 
-      - name: Apply Hide Stuff Patches
-        run: |
-          set -x
-          cd "$COMMON"
-          PATCH_FILE="69_hide_stuff.patch"
-          PATCH_SRC="$GITHUB_WORKSPACE/kernel_patches/$PATCH_FILE"
-          if [ ! -f "$PATCH_SRC" ]; then
-            echo "Error: $PATCH_FILE not found in $PATCH_SRC"
-            ls -la "$GITHUB_WORKSPACE/kernel_patches/"
-            exit 1
-          fi
-          cp "$PATCH_SRC" ./ || { echo "Error: Failed to copy $PATCH_FILE"; exit 1; }
-          echo "Applying $PATCH_FILE..."
-          patch -p1 --fuzz=3 --verbose < "./$PATCH_FILE" > hide_stuff.log 2>&1 || { cat hide_stuff.log; echo "Warning: Patch application failed or already applied, continuing..."; }
-
-      - name: Add Manager Patch
+      - name: Apply Manager Patch
         run: |
           set -x
           KSU_DIR="$PLATFORM/KernelSU-Next"
+          cd "$KSU_DIR"
           PATCH_FILE="manager.patch"
           PATCH_SRC="$GITHUB_WORKSPACE/kernel_patches/next/$PATCH_FILE"
-          echo "Changing to KernelSU-Next directory: $KSU_DIR"
-          if [ ! -d "$KSU_DIR" ]; then
-            echo "Error: KernelSU-Next directory $KSU_DIR does not exist"
-            ls -la "$PLATFORM"
-            exit 1
-          fi
-          cd "$KSU_DIR"
           if [ ! -f "$PATCH_SRC" ]; then
-            echo "Error: $PATCH_FILE not found in $PATCH_SRC"
+            echo "Error: $PATCH_FILE not found at $PATCH_SRC"
             ls -la "$GITHUB_WORKSPACE/kernel_patches/next/"
             exit 1
           fi
           cp "$PATCH_SRC" ./ || { echo "Error: Failed to copy $PATCH_FILE"; exit 1; }
-          echo "Applying $PATCH_FILE..."
-          patch -p1 --fuzz=3 --verbose < "./$PATCH_FILE" > manager.log 2>&1 || { cat manager.log; echo "Warning: Patch application failed or already applied, continuing..."; }
+          echo "Applying $PATCH_FILE..." > manager_patch.log
+          patch -p1 --fuzz=3 --verbose < "$PATCH_FILE" >> manager_patch.log 2>&1 || { cat manager_patch.log; echo "Error: Failed to apply $PATCH_FILE"; exit 1; }
 
-      - name: Add SUSFS Configuration Settings        
+      - name: Add SUSFS Configuration Settings
         run: |
           set -x
           cd "$PLATFORM"
-          echo "Adding configuration settings to gki_defconfig..."
-          cat >> "$DEFCONFIG" << EOF
-          CONFIG_KSU=y
-          CONFIG_KSU_WITH_KPROBES=n
-          CONFIG_KSU_SUSFS=y
-          CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
-          CONFIG_KSU_SUSFS_SUS_PATH=y
-          CONFIG_KSU_SUSFS_SUS_MOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
-          CONFIG_KSU_SUSFS_SUS_KSTAT=y
-          CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n
-          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
-          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-          CONFIG_KSU_SUSFS_ENABLE_LOG=y
-          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
-          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
-          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-          CONFIG_KSU_SUSFS_SUS_SU=n
-          CONFIG_TMPFS_XATTR=y
-          CONFIG_TMPFS_POSIX_ACL=y
-          CONFIG_WIREGUARD=y
-          CONFIG_IP_NF_NAT=y
-          CONFIG_IP_NF_TARGET_TTL=y
-          CONFIG_IP6_NF_TARGET_HL=y
-          CONFIG_IP6_NF_MATCH_HL=y
-          CONFIG_DEBUG_KERNEL=n
-          CONFIG_DYNAMIC_DEBUG=n  
-          CONFIG_DEBUG_INFO=n
-          CONFIG_TCP_CONG_ADVANCED=y
-          CONFIG_TCP_CONG_BBR=y
-          CONFIG_DEFAULT_TCP_CONG="bbr"
-          CONFIG_TCP_CONG_CDG=y
-          CONFIG_DEFAULT_BBR=y
-          CONFIG_DEFAULT_CUBIC=n
-          CONFIG_DEFAULT_CDG=n
-          CONFIG_NET_SCH_DEFAULT=y
-          CONFIG_DEFAULT_FQ=y
-          CONFIG_DEFAULT_NET_SCH="fq"
-          CONFIG_NET_SCH_HTB=y
-          CONFIG_NET_SCH_PRIO=y
-          CONFIG_NET_SCH_SFQ=y
-          CONFIG_NET_SCH_TBF=y
-          CONFIG_TCP_CONG_BIC=n
-          CONFIG_TCP_CONG_WESTWOOD=n
-          CONFIG_TCP_CONG_HTCP=y
-          CONFIG_IP_NF_TARGET_ECN=y
-          CONFIG_IP_ECN=y
-          CONFIG_TCP_ECN=y
-          CONFIG_IPV6_ECN=y
-          EOF
+          if [ ! -f "$DEFCONFIG" ]; then
+            echo "Error: gki_defconfig not found at $DEFCONFIG"
+            ls -la "$COMMON/arch/arm64/configs/"
+            exit 1
+          fi
+          echo "Adding configuration settings to gki_defconfig..." > config_settings.log
+          cat >> "$DEFCONFIG" << 'EOF'
+CONFIG_KSU=y
+CONFIG_KSU_WITH_KPROBES=n
+CONFIG_KSU_SUSFS=y
+CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
+CONFIG_KSU_SUSFS_SUS_PATH=y
+CONFIG_KSU_SUSFS_SUS_MOUNT=y
+CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+CONFIG_KSU_SUSFS_SUS_KSTAT=y
+CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n
+CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+CONFIG_KSU_SUSFS_ENABLE_LOG=y
+CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+CONFIG_KSU_SUSFS_SUS_SU=n
+CONFIG_TMPFS_XATTR=y
+CONFIG_TMPFS_POSIX_ACL=y
+CONFIG_WIREGUARD=y
+CONFIG_IP_NF_NAT=y
+CONFIG_IP_NF_TARGET_TTL=y
+CONFIG_IP6_NF_TARGET_HL=y
+CONFIG_IP6_NF_MATCH_HL=y
+CONFIG_DEBUG_KERNEL=n
+CONFIG_DYNAMIC_DEBUG=n
+CONFIG_DEBUG_INFO=n
+CONFIG_TCP_CONG_ADVANCED=y
+CONFIG_TCP_CONG_BBR=y
+CONFIG_DEFAULT_TCP_CONG="bbr"
+CONFIG_TCP_CONG_CDG=y
+CONFIG_DEFAULT_BBR=y
+CONFIG_DEFAULT_CUBIC=n
+CONFIG_DEFAULT_CDG=n
+CONFIG_NET_SCH_DEFAULT=y
+CONFIG_DEFAULT_FQ=y
+CONFIG_DEFAULT_NET_SCH="fq"
+CONFIG_NET_SCH_HTB=y
+CONFIG_NET_SCH_PRIO=y
+CONFIG_NET_SCH_SFQ=y
+CONFIG_NET_SCH_TBF=y
+CONFIG_TCP_CONG_BIC=n
+CONFIG_TCP_CONG_WESTWOOD=n
+CONFIG_TCP_CONG_HTCP=y
+CONFIG_IP_NF_TARGET_ECN=y
+CONFIG_IP_ECN=y
+CONFIG_TCP_ECN=y
+CONFIG_IPV6_ECN=y
+EOF
+          tail -n 50 "$DEFCONFIG" >> config_settings.log
 
       - name: Add sched_ext
         run: |
           set -x
           cd "$PLATFORM"
-          git clone https://github.com/egcd123/sched_ext.git || { echo "Error: Failed to clone sched_ext"; exit 1; }
-          cp -r ./sched_ext/* ./common/kernel/sched || { echo "Error: Failed to copy sched_ext files"; exit 1; }
+          git clone https://github.com/egcd123/sched_ext.git || { echo "Error: Failed to clone sched_ext"; exit 1; } > sched_ext.log 2>&1
+          cp -r ./sched_ext/* ./common/kernel/sched || { echo "Error: Failed to copy sched_ext files"; exit 1; } >> sched_ext.log
           rm -rf ./sched_ext/.git
           cd common/kernel/sched
-          sed -i.bak '/# include "ext.c"/a\# include "hmbird_sched_proc_main.c"\n#endif\n\n#ifdef CONFIG_SLIM_SCHED\n# include "slim_sysctl.c"' build_policy.c
+          sed -i.bak '/# include "ext.c"/a\# include "hmbird_sched_proc_main.c"\n#endif\n\n#ifdef CONFIG_SLIM_SCHED\n# include "slim_sysctl.c"' build_policy.c >> sched_ext.log
 
-      - name: Run sed and perl Commands
+      - name: Run Configuration Modifications
         run: |
           set -x
           cd "$PLATFORM"
-          echo "Running sed commands..."
+          echo "Applying configuration modifications..." > config_mods.log
+          cat << 'EOF' > config_mods.sh
+          #!/bin/bash
+          set -e
           sed -i 's/CONFIG_LTO=n/CONFIG_LTO=y/' "$DEFCONFIG"
           sed -i 's/CONFIG_LTO_CLANG_FULL=y/CONFIG_LTO_CLANG_THIN=y/' "$DEFCONFIG"
-          sed -i 's/CONFIG_LTO_CLANG_NONE=y/CONCONFIG_LTO_CLANG_THIN=y/' "$DEFCONFIG"
+          sed -i 's/CONFIG_LTO_CLANG_NONE=y/CONFIG_LTO_CLANG_THIN=y/' "$DEFCONFIG"
           sed -i 's/check_defconfig//' ./common/build.config.gki
-          sed -i '$s|echo "\$res"|echo "\$res"|' ./common/scripts/setlocalversion
-          sed -i '$s|echo "\$res"|echo "\$res"|' ./msm-kernel/scripts/setlocalversion
-          sed -i '$s|echo "\$res"|echo "\$res"|' ./external/dtc/scripts/setlocalversion
-          sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" ./build/kernel/kleaf/impl/stamp.bzl || echo "No stamp.bzl!"
           sed -i 's/-dirty//' ./common/scripts/setlocalversion
           sed -i 's/-dirty//' ./msm-kernel/scripts/setlocalversion
           sed -i 's/-dirty//' ./external/dtc/scripts/setlocalversion
-          sed -i 's/-dirty//' ./build/kernel/kleaf/workspace_status_stamp.py || echo "No workspace_status_stamp.py!"
+          sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" ./build/kernel/kleaf/impl/stamp.bzl || echo "No stamp.bzl"
+          sed -i 's/-dirty//' ./build/kernel/kleaf/workspace_status_stamp.py || echo "No workspace_status_stamp.py"
           sed -i '/echo "LTO $LTO "/i export LTO=thin' ./oplus/build/oplus_setup.sh
-          sed -i 's/export REPACK_IMG=true/export REPACK_IMG=false/g' ./oplus/build/oplus_setup.sh
+          sed -i 's/export REPACK_IMG=true/export REPACK_IMG=false/' ./oplus/build/oplus_setup.sh
           perl -pi -e 's{UTS_VERSION="\$\(echo \$UTS_VERSION \$CONFIG_FLAGS \$TIMESTAMP \| cut -b -\$UTS_LEN\)"}{UTS_VERSION="#1 SMP PREEMPT $(date -u +"%a %b %d %H:%M:%S UTC %Y")"}' ./common/scripts/mkcompile_h
           perl -pi -e 's{UTS_VERSION="\$\(echo \$UTS_VERSION \$CONFIG_FLAGS \$TIMESTAMP \| cut -b -\$UTS_LEN\)"}{UTS_VERSION="#1 SMP PREEMPT $(date -u +"%a %b %d %H:%M:%S UTC %Y")"}' ./msm-kernel/scripts/mkcompile_h
           find . -type f -exec sed -i 's/\(make\s\+-C[^\n]*\)\s\+/\1 -j$(nproc) /g' {} +
+          EOF
+          chmod +x config_mods.sh
+          ./config_mods.sh >> config_mods.log 2>&1
 
       - name: Build the Kernel
         run: |
           set -x
-          cd "$CONFIG"
-          echo "Building the kernel..."
+          cd "$WORKSPACE"
           sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
-          rm ./kernel_platform/common/android/abi_gki_protected_exports_* || echo "No protected exports!"
-          rm ./kernel_platform/msm-kernel/android/abi_gki_protected_exports_* || echo "No protected exports!"
-          rm -rf ./kernel_platform/out/bazel/cache || echo "No Bazel cache to clear!"
-          df -h
+          rm -rf /tmp/* ~/.cache/* || echo "No temp files to clear"
+          df -h >> disk_usage.log
+          cd "$PLATFORM"
           BUILD_TYPE="gki"
-          BAZEL_ARGS=(--jobs=4 --lto=thin --sandbox_debug --verbose_failures --verbose_explanations)
+          BAZEL_ARGS=(--jobs=$(nproc) --lto=thin --sandbox_debug --verbose_failures --verbose_explanations)
           if [ "${{ inputs.soc }}" == "sun" ]; then
             BUILD_TYPE="perf"
             BAZEL_ARGS+=(-g)
@@ -383,11 +399,8 @@ jobs:
             while true; do
               echo "=== $(date) ==="
               free -h
-              echo "======"
               df -h
-              echo "======"
               top -b -n 1 | head -n 15
-              echo ""
               AVAILABLE_SPACE=$(df -B1 / | tail -1 | awk "{print \$4}")
               if [ "$AVAILABLE_SPACE" -lt 2147483648 ]; then
                 echo "Error: Less than 2GB free space remaining"
@@ -395,46 +408,56 @@ jobs:
               fi
               sleep 30
             done
-          ') &
+          ') >> disk_monitor.log 2>&1 &
           MONITOR_PID=$!
           trap "kill $MONITOR_PID" EXIT
-          if [ -f ./kernel_platform/build_with_bazel.py ]; then
-            ./kernel_platform/oplus/bazel/oplus_modules_variant.sh ${{ inputs.soc }} "$BUILD_TYPE" ""
-            echo "Verifying images before lpmake..."
-            ls -l bazel-out/k8-fastbuild/bin/common/kernel_aarch64_images_system_dlkm_image/ || echo "System DLKM image directory not found"
-            ls -l bazel-out/k8-fastbuild/bin/msm-kernel/pineapple_gki_images_vendor_dlkm_image/ || echo "Vendor DLKM image directory not found"
-            ./kernel_platform/build_with_bazel.py -t ${{ inputs.soc }} $BUILD_TYPE "${BAZEL_ARGS[@]}" -o "$(pwd)/out" || {
-              echo "Bazel build failed, inspecting output directory..."
-              ls -la ./out/dist/
-              exit 1
-            }
+          if [ -f ./build_with_bazel.py ]; then
+            ./oplus/bazel/oplus_modules_variant.sh "${{ inputs.soc }}" "$BUILD_TYPE" "" > build_setup.log 2>&1 || { cat build_setup.log; echo "Error: oplus_modules_variant.sh failed"; exit 1; }
+            ls -l bazel-out/k8-fastbuild/bin/common/kernel_aarch64_images_system_dlkm_image/ >> build_setup.log || echo "System DLKM image directory not found" >> build_setup.log
+            ls -l bazel-out/k8-fastbuild/bin/msm-kernel/${{ inputs.soc }}_gki_images_vendor_dlkm_image/ >> build_setup.log || echo "Vendor DLKM image directory not found" >> build_setup.log
+            ./build_with_bazel.py -t "${{ inputs.soc }}" "$BUILD_TYPE" "${BAZEL_ARGS[@]}" -o "$(pwd)/out" > build.log 2>&1 || { cat build.log; ls -la ./out/dist/; echo "Error: Bazel build failed"; exit 1; }
           else
-            LTO=thin ./kernel_platform/oplus/build/oplus_build_kernel.sh ${{ inputs.soc }} "$BUILD_TYPE" --jobs=4 || { echo "Kernel build failed"; exit 1; }
+            LTO=thin ./oplus/build/oplus_build_kernel.sh "${{ inputs.soc }}" "$BUILD_TYPE" --jobs=$(nproc) > build.log 2>&1 || { cat build.log; echo "Error: Kernel build failed"; exit 1; }
           fi
 
       - name: Copy Images
         run: |
           set -x
-          cd "$CONFIG"
+          cd "$PLATFORM"
           if [ ! -f "./out/dist/Image" ]; then
             echo "Error: Kernel Image not found in out/dist/"
             ls -la ./out/dist/
             exit 1
           fi
-          echo "Copying Image"
-          cp ./out/dist/Image ../AnyKernel3/Image || { echo "Error: Failed to copy Image"; exit 1; }
+          cp ./out/dist/Image "$GITHUB_WORKSPACE/AnyKernel3/Image" || { echo "Error: Failed to copy Image"; exit 1; } > copy_image.log 2>&1
 
       - name: Create AnyKernel3 ZIP File
         run: |
           set -x
-          cd ./AnyKernel3
+          cd "$GITHUB_WORKSPACE/AnyKernel3"
           ZIP_NAME="${{ inputs.model }}_${{ inputs.android_version }}-${{ inputs.kernel_version }}_KSUN-${{ env.KSUVER }}_SUSFS-${{ env.SUSFSVER }}_AnyKernel3.zip"
-          echo "Creating zip file $ZIP_NAME..."
-          zip -r "../$ZIP_NAME" ./* || { echo "Error: Failed to create zip file"; exit 1; }
+          zip -r "$GITHUB_WORKSPACE/$ZIP_NAME" ./* || { echo "Error: Failed to create zip file"; exit 1; } > zip_creation.log 2>&1
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+
+      - name: Get Formatted Date
+        id: formatted_date
+        run: |
+          DATE=$(date -u +'%y%m%d-%H%M')
+          echo "formatted=$DATE" >> $GITHUB_OUTPUT
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-${{ env.CONFIG }}
+          name: kernel-${{ inputs.model }}-KSUN-${{ env.KSUVER }}-${{ steps.formatted_date.outputs.formatted }}-${{ github.run_id }}
           path: |
-            *.zip
+            ${{ env.ZIP_NAME }}
+            *.log
+
+      - name: Upload Logs as Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ inputs.model }}-${{ steps.formatted_date.outputs.formatted }}-${{ github.run_id }}
+          path: |
+            *.log
+            repo_projects.txt
